@@ -1,0 +1,7 @@
+__pycache__/
+data/
+logs/
+logs_claude.txt
+out/
+*.env
+.secrets/

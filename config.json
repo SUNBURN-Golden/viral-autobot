@@ -1,0 +1,144 @@
+{
+  "user_agent": "SoulboundViralAutobot/1.0 (+https://hanset.soulbound.co.kr)",
+  "campaign": "viral_w1",
+  "channels": ["x", "threads", "instagram", "reddit"],
+  "paths": {
+    "db": "data/autobot.db",
+    "logs": "logs",
+    "drafts": "out/drafts",
+    "status_slack": "out/status_slack.txt",
+    "rounds_log": "/workspace/viral/w1/rounds.log",
+    "status_md": "/workspace/viral/w1/status.md"
+  },
+  "limits": {
+    "max_urls_per_site": 500,
+    "max_page_fetches_per_site": 30,
+    "max_sitemap_fetches_per_site": 8,
+    "max_sitemap_depth": 2,
+    "first_run_draft_pages": 5,
+    "http_timeout": 20,
+    "max_bytes": 2000000,
+    "request_sleep": [2.0, 5.0],
+    "reddit_min_sleep": 6.0,
+    "max_reddit_requests_per_run": 40,
+    "max_metric_checks_per_run": 40
+  },
+  "projects": [
+    {
+      "name": "hanset",
+      "url": "https://hanset.soulbound.co.kr",
+      "tagline_en": "HANSET - Seoul CrossFit drop-in guides and Korea sauna / jjimjilbang tattoo rules",
+      "tagline_ko": "한셋 - 서울 크로스핏 드랍인 가이드, 한국 사우나·찜질방 문신 규정",
+      "keywords": [
+        "crossfit drop-in korea",
+        "korean sauna tattoo",
+        "hyrox seoul",
+        "크로스핏 드랍인",
+        "한국 사우나 문신"
+      ],
+      "hashtags": ["#CrossFit", "#HYROX", "#Seoul", "#KoreaTravel", "#jjimjilbang"],
+      "rss_feeds": [],
+      "aliases": {
+        "domains": ["hanset.soulbound.co.kr", "cfhannam.com"],
+        "names": ["hanset", "한셋", "crossfit hannam"],
+        "terms": [
+          "crossfit", "drop-in", "drop in", "hyrox", "jjimjilbang", "sauna",
+          "tattoo", "크로스핏", "드랍인", "하이록스", "사우나", "찜질방", "문신"
+        ]
+      }
+    },
+    {
+      "name": "goallit",
+      "url": "https://goal-lit.soulbound.co.kr",
+      "tagline_en": "GoalLit - Korean webtoon and web-novel reviews, critique and reading lists",
+      "tagline_ko": "골릿 - 웹툰·웹소설 리뷰와 비평, 추천 목록",
+      "keywords": [
+        "webtoon review",
+        "web novel critique",
+        "korean literature",
+        "웹툰 리뷰",
+        "웹소설 비평"
+      ],
+      "hashtags": ["#webtoon", "#webnovel", "#KoreanLiterature", "#코믹스", "#웹소설"],
+      "rss_feeds": [],
+      "aliases": {
+        "domains": ["goal-lit.soulbound.co.kr", "goallit.soulbound.co.kr"],
+        "names": ["goallit", "goal-lit", "골릿"],
+        "terms": [
+          "webtoon", "web novel", "webnovel", "web fiction", "korean literature",
+          "literature", "웹툰", "웹소설", "웹 소설", "한국 문학"
+        ]
+      }
+    },
+    {
+      "name": "kitchengenome",
+      "url": "https://kitchengenome.soulbound.co.kr",
+      "tagline_en": "Kitchen Genome - Korean chef lineages and Seoul fine dining notes",
+      "tagline_ko": "키친지놈 - 한국 셰프 계보와 서울 파인다이닝 기록",
+      "keywords": [
+        "korean chef",
+        "fine dining seoul",
+        "chef lineage",
+        "한국 셰프",
+        "서울 파인다이닝"
+      ],
+      "hashtags": ["#FineDining", "#SeoulFood", "#Chef", "#KoreanFood", "#파인다이닝"],
+      "rss_feeds": [],
+      "aliases": {
+        "domains": ["kitchengenome.soulbound.co.kr"],
+        "names": ["kitchengenome", "kitchen genome", "키친지놈"],
+        "terms": [
+          "chef", "fine dining", "culinary", "restauran", "요리", "셰프",
+          "파인다이닝", "파인 다이닝", "레스토랑"
+        ]
+      }
+    },
+    {
+      "name": "pitchboard",
+      "url": "https://pitchboard.soulbound.co.kr",
+      "tagline_en": "pitchboard - open calls for paid book reviews, criticism and essay submissions",
+      "tagline_ko": "피치보드 - 유료 도서 리뷰·비평·에세이 공모 정보, 마감일과 금액",
+      "keywords": [
+        "open call",
+        "call for submissions",
+        "grants deadline",
+        "공모전 마감",
+        "유료 도서 리뷰"
+      ],
+      "hashtags": ["#OpenCall", "#WritingCommunity", "#BookReview", "#공모전", "#창작"],
+      "rss_feeds": [],
+      "aliases": {
+        "domains": [
+          "pitchboard.soulbound.co.kr",
+          "inboxreads.co",
+          "directory.goletter.co",
+          "goletter.co",
+          "newsletter.place"
+        ],
+        "names": ["pitchboard", "피치보드", "open calls by pitchboard"],
+        "terms": [
+          "open call", "call for submissions", "submissions", "grants deadline",
+          "grant", "book review", "book reviews", "books", "publishing", "writing",
+          "newsletter", "공모전", "원고", "지원금", "출판", "도서", "책"
+        ]
+      }
+    },
+    {
+      "name": "agamajung",
+      "url": null,
+      "tagline_en": "agamajung - baby gear and stroller deal notes for Korea",
+      "tagline_ko": "아가마중 - 국내 유아용품·유모차 혜택 정보",
+      "keywords": ["baby gear korea", "stroller deal", "유아용품", "유모차 할인"],
+      "hashtags": ["#BabyGear", "#Stroller", "#육아", "#유아용품"],
+      "rss_feeds": [],
+      "aliases": {
+        "domains": [],
+        "names": ["agamajung", "아가마중"],
+        "terms": [
+          "baby gear", "stroller", "baby", "유아용품", "유모차", "아기", "육아"
+        ]
+      },
+      "blocker_note": "공개 URL 없음"
+    }
+  ]
+}

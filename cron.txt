@@ -1,0 +1,6 @@
+# Soulbound viral autobot - cron schedule (do NOT install automatically;
+# review first, then `crontab -e` and paste the lines below).
+# Box TZ is Asia/Seoul; CRON_TZ keeps it explicit.
+CRON_TZ=Asia/Seoul
+0 */3 * * * cd /workspace/viral/autobot && /usr/bin/python3 autobot.py run >> logs/run.log 2>&1
+50 20 * * * cd /workspace/viral/autobot && /usr/bin/python3 autobot.py status >> logs/status.log 2>&1
