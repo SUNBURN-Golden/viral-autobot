@@ -15,8 +15,8 @@ Design / hard rules (this tool has no posting capability by construction):
     >= 6 s between Reddit requests, URL/page-fetch caps per site per run
   * drafts are templates only (no LLM) and always carry the header
     "DRAFT - VIRAL compliance check required before posting"
-  * metrics are only what a public, unauthenticated request can see;
-    anything unknown is reported as "미확인" and never guessed
+  * metrics come from public, unauthenticated checks or locally supplied aggregate
+    insights; anything unknown is reported as "미확인" and never guessed
 
 Everything degrades to a blocker row in the DB + a log line; nothing raises out
 of a single project's failure.
@@ -31,6 +31,7 @@ import gzip
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -65,6 +66,12 @@ ACCEPT_XML = "application/xml,text/xml,application/rss+xml,application/atom+xml;
 ACCEPT_JSON = "application/json;q=0.9,*/*;q=0.8"
 
 UNKNOWN = "미확인"
+DIRECT_UNKNOWN = "직접 유입/출처 미확인"
+TIER_METRICS = {
+    1: {"views", "likes", "comments", "score"},
+    2: {"reach", "shares", "saves", "watch", "link_clicks"},
+    3: {"resource_views", "comparisons", "saves", "signups", "revisits", "confirmed_purchases"},
+}
 
 # file extensions never treated as crawlable content pages
 SKIP_EXT = {
@@ -238,6 +245,7 @@ def load_config(path: str) -> dict:
     _set_defaults(cfg, {"demand": DEMAND_DEFAULTS,
                         "evidence": {"dir": "data/evidence", "expiry_warn_days": 7},
                         "questions": {"dir": "data/questions"},
+                        "metrics": {"dir": "data/metrics"},
                         "hooks": {"types": list(HOOK_TYPES), "default": "loss_prevention",
                                   "banned_terms": list(BAIT_TERMS)}})
     limits.setdefault("max_question_drafts_per_run", 5)
@@ -345,6 +353,7 @@ CREATE TABLE IF NOT EXISTS drafts (
   created TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'candidate',
   hold_reason TEXT,
+  asset_id TEXT, keyword_cluster TEXT, campaign_id TEXT,
   UNIQUE (project, page_url)
 );
 CREATE TABLE IF NOT EXISTS published (
@@ -367,7 +376,9 @@ CREATE TABLE IF NOT EXISTS published (
   target_url TEXT,
   state TEXT NOT NULL DEFAULT 'published_verified',
   verified_at TEXT,
-  hold_reason TEXT
+  hold_reason TEXT,
+  asset_id TEXT, keyword_cluster TEXT, campaign_id TEXT,
+  why_this_channel TEXT, why_now TEXT, evidence_ids TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pub_proj ON published (project);
 CREATE TABLE IF NOT EXISTS metric_checks (
@@ -384,6 +395,19 @@ CREATE TABLE IF NOT EXISTS metric_checks (
   UNIQUE (published_id, check_kind)
 );
 CREATE INDEX IF NOT EXISTS idx_checks_due ON metric_checks (status, due_at);
+CREATE TABLE IF NOT EXISTS metric_observations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  brand TEXT,
+  entity TEXT NOT NULL CHECK (entity IN ('draft','post','site')),
+  entity_id INTEGER,
+  post_id TEXT, asset_id TEXT, keyword_cluster TEXT, hook_type TEXT, channel TEXT, campaign_id TEXT,
+  tier INTEGER NOT NULL CHECK (tier IN (1,2,3)),
+  metric TEXT NOT NULL, value REAL, window TEXT, observed_at TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'manual',
+  attribution TEXT NOT NULL DEFAULT '직접 유입/출처 미확인',
+  note TEXT, dedupe_key TEXT UNIQUE, created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_observations_brand ON metric_observations(brand,tier);
 CREATE TABLE IF NOT EXISTS post_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   post_id TEXT,
@@ -460,22 +484,25 @@ def db_connect(cfg: dict) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
-    _migrate(conn)
+    _migrate(conn, cfg)
     conn.commit()
     return conn
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
+def _migrate(conn: sqlite3.Connection, cfg: dict) -> None:
     """Upgrade existing ledgers in place; safe to repeat on every connection."""
     additions = {
         "pages": {"http_status": "INTEGER", "last_verified": "TEXT", "valid_until": "TEXT"},
         "drafts": {"state": "TEXT NOT NULL DEFAULT 'candidate'", "hold_reason": "TEXT",
                    "question_id": "INTEGER", "landing_url": "TEXT", "hook_type": "TEXT",
-                   "evidence_ids": "TEXT", "why_this_channel": "TEXT", "why_now": "TEXT"},
+                   "evidence_ids": "TEXT", "why_this_channel": "TEXT", "why_now": "TEXT",
+                   "asset_id": "TEXT", "keyword_cluster": "TEXT", "campaign_id": "TEXT"},
         "published": {"post_id": "TEXT", "channel": "TEXT", "target_url": "TEXT",
                       "state": "TEXT NOT NULL DEFAULT 'published_verified'",
                       "verified_at": "TEXT", "hold_reason": "TEXT",
-                      "question_id": "INTEGER", "hook_type": "TEXT"},
+                      "question_id": "INTEGER", "hook_type": "TEXT", "asset_id": "TEXT",
+                      "keyword_cluster": "TEXT", "campaign_id": "TEXT", "why_this_channel": "TEXT",
+                      "why_now": "TEXT", "evidence_ids": "TEXT"},
         "metric_checks": {"retry_at": "TEXT", "failure_reason": "TEXT"},
     }
     with conn:
@@ -510,6 +537,30 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 conn.execute("UPDATE metric_checks SET status='failed', retry_at=NULL, "
                              "failure_reason=? WHERE id=?",
                              (result.get("reason") or "legacy unchecked result", row["id"]))
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('campaign',?)",
+                     (cfg.get("campaign", "viral_w1"),))
+        _backfill_content_metadata(conn, cfg)
+
+
+def make_asset_id(entity, project, identity):
+    value = f"{entity}|{project or ''}|{identity}"
+    return "a_" + hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _backfill_content_metadata(conn, cfg):
+    """Retain existing identities; unknown historical metadata stays explicitly unknown."""
+    for entity, table in (("draft", "drafts"), ("post", "published")):
+        for row in conn.execute(f"SELECT * FROM {table} WHERE asset_id IS NULL").fetchall():
+            q = conn.execute("SELECT keyword_cluster FROM questions WHERE id=? AND project=?",
+                             (row["question_id"], row["project"])).fetchone()
+            identity = row["page_url"] if entity == "draft" else row["post_id"] or str(row["id"])
+            conn.execute(f"UPDATE {table} SET asset_id=?,keyword_cluster=COALESCE(keyword_cluster,?),"
+                         "campaign_id=COALESCE(campaign_id,?),hook_type=COALESCE(hook_type,?),"
+                         "why_this_channel=COALESCE(why_this_channel,?),why_now=COALESCE(why_now,?),"
+                         "evidence_ids=COALESCE(evidence_ids,'[]') WHERE id=?",
+                         (make_asset_id(entity, row["project"], identity), (q[0] if q else None) or UNKNOWN,
+                          cfg.get("campaign", "viral_w1") if entity == "draft" or row["source"] == "ledger" else UNKNOWN,
+                          UNKNOWN, UNKNOWN, UNKNOWN, row["id"]))
 
 
 def meta_get(conn: sqlite3.Connection, key: str):
@@ -561,6 +612,8 @@ def transition(conn, entity, entity_id, dst, now, reason="") -> str:
         if src != dst:
             if not can_transition(src, dst):
                 raise ValueError(f"invalid transition: {src} -> {dst}")
+            if entity == "post" and dst == "published_verified" and (not row["url"] or not row["verified_at"]):
+                raise ValueError("confirm a public URL with queue verify before publication")
             conn.execute(f"UPDATE {table} SET state=?, hold_reason=? WHERE id=?",
                          (dst, reason if dst in HOLD_STATES else None, entity_id))
             conn.execute(
@@ -583,24 +636,48 @@ def make_post_id(project, channel, url=None, label=None) -> str:
 
 
 def record_post(conn, project, channel, target_url, label, now, state="scheduled",
-                evidence_ids=()) -> str:
+                evidence_ids=(), draft_id=None, question_id=None, why_this_channel=None,
+                why_now=None, campaign_id=None, hook_type=None) -> str:
     """Record planned work, without asserting that anything has been published."""
     if state not in PRE_PUBLISH + HOLD_STATES:
         raise ValueError("record_post requires a pre-publication or hold state")
     post_id = make_post_id(project, channel, target_url, label)
+    draft = None
+    if draft_id is not None:
+        draft = conn.execute("SELECT * FROM drafts WHERE id=? AND project=?", (draft_id, project)).fetchone()
+        if draft is None:
+            raise ValueError("draft must belong to the post brand")
+        question_id = question_id or draft["question_id"]
+        evidence_ids = set(evidence_ids) | set(_json_list(draft["evidence_ids"]))
+    q = None
+    if question_id is not None:
+        q = conn.execute("SELECT * FROM questions WHERE id=? AND project=?", (question_id, project)).fetchone()
+        if q is None:
+            raise ValueError("question must belong to the post brand")
+    asset_id = (draft["asset_id"] if draft else None) or make_asset_id("post", project, post_id)
+    cluster = (q["keyword_cluster"] if q else draft["keyword_cluster"] if draft else None) or UNKNOWN
+    campaign_id = campaign_id or (draft["campaign_id"] if draft else None) or meta_get(conn, "campaign") or "viral_w1"
+    hook_type = hook_type or (draft["hook_type"] if draft else None) or UNKNOWN
+    why_this_channel = why_this_channel or (_why_this_channel(q, channel) if q else
+                                          f"{channel} — human channel review required")
+    why_now = why_now or (q["why_now"] if q else draft["why_now"] if draft else None) or "수동 게시 후보 등록; 시점 검토 필요"
     with conn:
         conn.execute(
             "INSERT OR IGNORE INTO published "
-            "(post_id, project, channel, kind, target_url, label, state, published_at, source, first_seen) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ledger', ?)",
+            "(post_id, project, channel, kind, target_url, label, state, published_at, source, first_seen,"
+            "asset_id,keyword_cluster,campaign_id,hook_type,question_id,why_this_channel,why_now,evidence_ids) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ledger', ?,?,?,?,?,?,?,?,?)",
             (post_id, project, channel, channel, normalize_url(target_url) or None,
-             label, state, iso(now), iso(now)))
+             label, state, iso(now), iso(now), asset_id, cluster, campaign_id, hook_type, question_id,
+             why_this_channel, why_now, json.dumps(sorted(evidence_ids))))
         row = conn.execute("SELECT id FROM published WHERE post_id=?", (post_id,)).fetchone()
         for evidence_id in evidence_ids:
-            evidence = conn.execute("SELECT status,valid_until FROM evidence WHERE id=?", (evidence_id,)).fetchone()
-            if not evidence or evidence["status"] != "active" or _evidence_date(evidence["valid_until"]) < kst(now):
+            evidence = conn.execute("SELECT project,status,valid_until FROM evidence WHERE id=?", (evidence_id,)).fetchone()
+            if not evidence or evidence["project"] != project or evidence["status"] != "active" or _evidence_date(evidence["valid_until"]) < kst(now):
                 raise ValueError("post evidence must be active and unexpired")
             link_evidence(conn, evidence_id, "post", row["id"])
+        ids = [e["id"] for e in linked_evidence(conn, "post", row["id"], active_only=False)]
+        conn.execute("UPDATE published SET evidence_ids=? WHERE id=?", (json.dumps(ids), row["id"]))
     return post_id
 
 
@@ -614,6 +691,8 @@ def mark_published_verified(conn, post_id, post_url, verified_at, now):
         if row is None:
             raise ValueError(f"unknown post_id: {post_id}")
         if row["state"] == "scheduled":
+            if not isinstance(verified_at, datetime) or kst(verified_at) > kst(now):
+                raise ValueError("verified_at must be a confirmed, non-future datetime")
             conn.execute("UPDATE published SET url=?, verified_at=?, published_at=? WHERE id=?",
                          (url, iso(verified_at), iso(verified_at), row["id"]))
             transition(conn, "post", row["id"], "published_verified", now)
@@ -621,6 +700,32 @@ def mark_published_verified(conn, post_id, post_url, verified_at, now):
             raise ValueError(f"cannot verify post in state {row['state']}")
         # Repeated verification preserves the original timestamp and due dates.
     _queue_metric_checks(conn, now)
+
+
+def queue_list(conn, project=None, state=None, entity="all"):
+    """Return a common view of draft packets and individual post records."""
+    if entity not in ("all", "draft", "post"):
+        raise ValueError("unknown queue entity")
+    if state is not None and state not in POST_FLOW + HOLD_STATES:
+        raise ValueError("unknown queue state")
+    rows = []
+    for kind, table in (("draft", "drafts"), ("post", "published")):
+        if entity not in ("all", kind):
+            continue
+        where, params = [], []
+        for key, value in (("project", project), ("state", state)):
+            if value is not None:
+                where.append(key + "=?")
+                params.append(value)
+        for row in conn.execute(f"SELECT * FROM {table}" +
+                                (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id", params):
+            rows.append({"entity": kind, "id": row["id"], "post_id": row["post_id"] if kind == "post" else None,
+                         "asset_id": row["asset_id"], "project": row["project"],
+                         "channel": row["channel"] if kind == "post" else row["channels"],
+                         "state": row["state"], "hold_reason": row["hold_reason"],
+                         "label": row["label"] if kind == "post" else row["page_url"],
+                         "created": row["first_seen"] if kind == "post" else row["created"]})
+    return rows
 
 
 # --------------------------------------------------------------------------
@@ -914,15 +1019,20 @@ def normalize_url(url: str, base: str = "") -> str:
     return f"{parts.scheme}://{host}{path}{query}"  # fragment dropped on purpose
 
 
-def add_utm(url: str, channel: str, campaign: str, content=None) -> str:
+def add_utm(url: str, channel: str, campaign: str, content=None,
+            asset_id=None, keyword_cluster=None, brand=None) -> str:
     """Merge utm_* params into an existing query string without clobbering it."""
     if not url:
         return url
     parts = urllib.parse.urlsplit(url)
     params = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
-    wanted = {"utm_source": channel, "utm_medium": "social", "utm_campaign": campaign}
+    wanted = {"utm_source": channel, "utm_medium": "organic" if channel == "search_page" else "social",
+              "utm_campaign": campaign}
     if content is not None:
         wanted["utm_content"] = content
+    for key, value in (("utm_asset", asset_id), ("utm_term", keyword_cluster), ("utm_brand", brand)):
+        if value is not None:
+            wanted[key] = value
     kept, seen = [], set()
     for key, value in params:
         if key in wanted:
@@ -2197,7 +2307,10 @@ def _select_hook(hooks, cfg):
     return next((k for k in (preferred, *HOOK_TYPES) if k in hooks and hooks[k]["status"] == "ok"), None)
 
 
-def _why_this_channel(q):
+QUESTION_PACKET_CHANNELS = ("search_page", "x", "threads", "instagram", "reddit")
+
+
+def _why_this_channel(q, channel=None):
     reasons = {
         "reddit": ("기존 질문에 조건과 근거로 직접 답변", "Answer an existing question with conditions and evidence"),
         "threads": ("근거 하나와 해석 질문으로 대화", "Discuss one supported point with a question"),
@@ -2205,48 +2318,97 @@ def _why_this_channel(q):
         "x": ("짧은 조건 요약과 심층 자료 안내", "Share a short condition summary with deeper evidence"),
         "search_page": ("반복되는 질문에 답과 출처를 장기 보존", "Keep an answer and sources for a recurring search question"),
     }
-    channel = q["natural_channel"]
-    reason = reasons[channel][0 if q["language"] == "ko" else 1]
+    channel = channel or q["natural_channel"]
+    reason = reasons.get(channel, ("채널 적합성 검토 필요", "Channel review required"))[0 if q["language"] == "ko" else 1]
     return f"{channel} — {reason}"
+
+
+def _without_urls(text):
+    return re.sub(r"(?:https?://\S+|(?:[\w-]+\.)+[a-zA-Z]{2,63}(?:/\S*)?)", "", text)
+
+
+def _fmt_search_page(ctx):
+    q = ctx["q"]
+    lines = [f"# {q['question']}", f"slug: {slugify(q['question'])}", f"canonical: {ctx['link']}",
+             "", "### 질문 / Question", q["question"], "", "### 답 / Answer"]
+    for e in ctx["evidences"]:
+        lines.extend(_json_list(e["allowed_claims"]))
+    lines += ["", "### 근거 / Evidence"]
+    for e in ctx["evidences"]:
+        lines += [f"- [{e['id']}] fact: {e['fact']}", f"  source_url: {e['source_url']}",
+                  f"  verified_at: {e['verified_at']}", f"  valid_until: {e['valid_until']}"]
+    return "\n".join(lines)
+
+
+def _fmt_instagram(ctx):
+    evidences = ctx["evidences"]
+    kinds = {e["kind"] for e in evidences}
+    layout = "경력 지도 / Career map" if "career" in kinds else (
+        "비교 카드 / Comparison cards" if "comparison" in kinds else "체크리스트 / Checklist")
+    rows = [f"[CARD 1/3] {layout}", ctx["hook_text"], "", "[CARD 2/3]"]
+    for e in evidences:
+        claim = _json_list(e["allowed_claims"])[0]
+        if "career" in kinds:
+            rows.append(f"• 확인된 경력 / Verified career: {claim}")
+        elif "comparison" in kinds:
+            rows.append(f"| 확인 조건 / Condition | {claim} |")
+        else:
+            rows.append(f"☐ {claim}")
+    rows += ["", "[CARD 3/3] 저장·공유 / Save and share",
+             f"확인일 / Verified: {evidences[0]['verified_at']}",
+             f"캡션 / Caption: {ctx['claim']}", f"link in bio: {ctx['link']}",
+             " ".join(ctx["proj"].hashtags[:5])]
+    return "\n".join(rows).strip()
+
+
+def _fmt_threads(ctx):
+    ko = ctx["lang"] == "ko"
+    return (f"의견 / Opinion: {ctx['hook_text']}\n\n근거 / Evidence: {ctx['claim']}\n\n질문 / Question: " +
+            ("어떤 조건이 선택에 가장 영향을 주나요?" if ko else "Which condition matters most to your decision?") +
+            f"\n{ctx['link']}")
+
+
+def _fmt_reddit(ctx):
+    return _without_urls(f"답변 / Direct answer: {ctx['claim']}\n\n" +
+                         "홍보 허용 여부 확인 필요 / Check community promotion rules\n" +
+                         "운영자 관계 표시 필요 / Disclose the brand relationship before posting")
+
+
+def _fmt_x(ctx):
+    text = (clip(ctx["hook_text"], max(0, 279 - len(ctx["link"]))) + "\n" + ctx["link"]).strip()
+    return text if len(text) <= 280 else clip(ctx["hook_text"], 280)
+
+
+CHANNEL_RENDERERS = {"search_page": _fmt_search_page, "instagram": _fmt_instagram,
+                     "threads": _fmt_threads, "reddit": _fmt_reddit, "x": _fmt_x}
 
 
 def render_question_packet(proj, q, evidences, hooks, cfg, now) -> str:
     selected = _select_hook(hooks, cfg)
     if selected is None:
         raise ValueError("no permitted hook")
-    hook = hooks[selected]["text"]
-    lang = q["language"]
-    claim = _json_list(evidences[0]["allowed_claims"])[0]
-    links = {ch: add_utm(q["target_landing_url"], ch, cfg["campaign"], selected) for ch in cfg["channels"]}
-    lines = [DRAFT_HEADER, "", f"- project: {proj.name}", f"- generated: {fmt_kst(now)}",
+    asset_id = make_asset_id("draft", proj.name, "question:" + q["question_key"])
+    ids = json.dumps([e["id"] for e in evidences])
+    lines = [DRAFT_HEADER, "", f"- project: {proj.name}", f"- brand: {proj.name}",
+             f"- asset_id: {asset_id}", f"- keyword_cluster: {q['keyword_cluster'] or UNKNOWN}",
+             f"- campaign_id: {cfg['campaign']}", f"- hook_type: {selected}", f"- generated: {fmt_kst(now)}",
              f"- persona_decision: {q['persona_decision']}", f"- why_now: {q['why_now']}",
-             f"- why_this_channel: {_why_this_channel(q)}",
-             f"- tone: {proj.demand.get('tone', '')}",
-             f"- evidence_ids: {json.dumps([e['id'] for e in evidences])}",
-             f"- search_volume_status: {q['search_volume_status']}",
+             f"- why_this_channel: {_why_this_channel(q)}", f"- tone: {proj.demand.get('tone', '')}",
+             f"- evidence_ids: {ids}", f"- search_volume_status: {q['search_volume_status']}",
              f"- target_landing_url: {q['target_landing_url']}", "", "## hooks (compare)", ""]
     for kind in HOOK_TYPES:
         item = hooks[kind]
         lines.append(f"- {kind} [{item['status']}]: {item['text']} (blocked_terms: {item['blocked_terms']})")
-    # Reddit is a direct answer, never a link placement. Strip URLs even from verified claims.
-    answer = re.sub(r"(?:https?://\S+|(?:[\w-]+\.)+[a-zA-Z]{2,63}(?:/\S*)?)", "", claim)
-    for ch in cfg["channels"]:
-        link = links[ch]
-        if ch == "x":
-            text = (clip(hook, max(0, 279 - len(link))) + "\n" + link).strip()
-            text = text if len(text) <= 280 else clip(hook, 280)
-        elif ch == "threads":
-            text = f"{hook}\n\n" + ("어떤 조건이 선택에 가장 영향을 주나요?" if lang == "ko" else
-                                     "Which condition matters most to your decision?") + f"\n{link}"
-        elif ch == "instagram":
-            text = ("비교 체크리스트 — 저장해 두세요" if lang == "ko" else "Comparison checklist — save for planning")
-            text += f"\n\n{hook}\n• {claim}\n" + ("확인일: " if lang == "ko" else "Verified: ")
-            text += f"{evidences[0]['verified_at']}\n{link}"
-        else:
-            text = ("확인된 조건: " if lang == "ko" else "Verified condition: ") + answer
-            text += "\n" + ("조건과 유효기간을 확인한 뒤 결정하세요." if lang == "ko" else
-                             "Check the conditions and validity dates before deciding.")
-        lines += ["", f"## {ch}", "", "```text", text, "```"]
+    for ch in QUESTION_PACKET_CHANNELS:
+        link = add_utm(q["target_landing_url"], ch, cfg["campaign"], selected,
+                       asset_id, q["keyword_cluster"] or UNKNOWN, proj.name)
+        ctx = {"proj": proj, "q": q, "hook_text": hooks[selected]["text"], "hook_type": selected,
+               "claim": _json_list(evidences[0]["allowed_claims"])[0], "evidences": evidences,
+               "lang": q["language"], "link": link, "now": now}
+        why_now = _without_urls(q["why_now"]) if ch == "reddit" else q["why_now"]
+        lines += ["", f"## {ch}", "", f"- channel: {ch}", f"- why_this_channel: {_why_this_channel(q, ch)}",
+                  f"- why_now: {why_now}", f"- evidence_ids: {ids}", "", "```text",
+                  CHANNEL_RENDERERS[ch](ctx), "```"]
     lines += ["", "## evidence", ""]
     for e in evidences:
         lines += [f"- [{e['id']}] fact: {e['fact']}", f"  source_url: {e['source_url']}",
@@ -2294,12 +2456,16 @@ def generate_question_drafts(conn, cfg, projects, now) -> int:
             why = _why_this_channel(q)
             ids = json.dumps([e["id"] for e in evidences])
             conn.execute("INSERT INTO drafts (project,page_url,path,channels,created,question_id,landing_url,"
-                         "hook_type,evidence_ids,why_this_channel,why_now) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                         "hook_type,evidence_ids,why_this_channel,why_now,asset_id,keyword_cluster,campaign_id) "
+                         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                          "ON CONFLICT(project,page_url) DO UPDATE SET path=excluded.path,channels=excluded.channels,"
                          "created=excluded.created,landing_url=excluded.landing_url,hook_type=excluded.hook_type,"
-                         "evidence_ids=excluded.evidence_ids,why_this_channel=excluded.why_this_channel,why_now=excluded.why_now",
-                         (proj.name, "question:" + q["question_key"], path, ",".join(cfg["channels"]), iso(now),
-                          q["id"], q["target_landing_url"], selected, ids, why, q["why_now"]))
+                         "evidence_ids=excluded.evidence_ids,why_this_channel=excluded.why_this_channel,why_now=excluded.why_now,"
+                         "asset_id=excluded.asset_id,keyword_cluster=excluded.keyword_cluster,campaign_id=excluded.campaign_id",
+                         (proj.name, "question:" + q["question_key"], path, ",".join(QUESTION_PACKET_CHANNELS), iso(now),
+                          q["id"], q["target_landing_url"], selected, ids, why, q["why_now"],
+                          make_asset_id("draft", proj.name, "question:" + q["question_key"]),
+                          q["keyword_cluster"] or UNKNOWN, cfg["campaign"]))
             draft = conn.execute("SELECT id,state FROM drafts WHERE project=? AND page_url=?",
                                  (proj.name, "question:" + q["question_key"])).fetchone()
             if draft["state"] in HOLD_STATES:
@@ -2367,6 +2533,12 @@ def generate_drafts(conn: sqlite3.Connection, cfg: dict, projects, now: datetime
                 """,
                 (proj.name, page["url"], path, ",".join(cfg.get("channels", [])),
                  page["last_status"], iso(now)))
+            cluster = match_cluster(proj, (page["title"] or "") + " " + page["url"])
+            conn.execute("UPDATE drafts SET asset_id=?,keyword_cluster=?,campaign_id=?,hook_type=?,"
+                         "why_this_channel=?,why_now=?,evidence_ids='[]' WHERE project=? AND page_url=?",
+                         (make_asset_id("draft", proj.name, page["url"]), cluster["key"] if cluster else UNKNOWN,
+                          campaign, "page_update", _why_this_channel({"natural_channel": proj.demand.get("natural_channel", "x"),
+                          "language": "ko"}), f"page {page['last_status']} in latest crawl", proj.name, page["url"]))
             if cfg.get("demand", {}).get("hold_pages_without_demand", True):
                 demand = conn.execute("SELECT 1 FROM questions WHERE project=? AND target_landing_url=? "
                                       "AND score_demand>=? LIMIT 1",
@@ -2385,7 +2557,11 @@ def render_packet(proj: Project, page, cfg: dict, campaign: str, now: datetime) 
     title = clean_ws(page["title"]) or _title_from_url(url)
     desc = clean_ws(page["description"]) or proj.tagline_en
     tags = " ".join(proj.hashtags[:5]) if proj.hashtags else ""
-    links = {ch: add_utm(url, ch, campaign) for ch in cfg.get("channels", [])}
+    asset_id = make_asset_id("draft", proj.name, url)
+    cluster = match_cluster(proj, title + " " + url)
+    cluster_key = cluster["key"] if cluster else UNKNOWN
+    links = {ch: add_utm(url, ch, campaign, "page_update", asset_id, cluster_key, proj.name)
+             for ch in cfg.get("channels", [])}
     gen = fmt_kst(now)
     status_line = page["last_status"]
 
@@ -2395,6 +2571,10 @@ def render_packet(proj: Project, page, cfg: dict, campaign: str, now: datetime) 
     x_tail = f"\n{x_link}\n{tags}".rstrip()
     x_desc = clip(desc, max(0, 280 - len(x_head) - len(x_tail) - 1))
     x_text = "\n".join(part for part in (x_head, x_desc, x_link, tags) if part)
+    if len(x_text) > 280:
+        x_text = (clip(title, max(0, 279 - len(x_link))) + "\n" + x_link).strip()
+        if len(x_text) > 280:
+            x_text = clip(title, 280)
 
     # --- threads ----------------------------------------------------------
     threads_text = (
@@ -2429,6 +2609,9 @@ def render_packet(proj: Project, page, cfg: dict, campaign: str, now: datetime) 
         "> rules, factual accuracy and self-promotion policy before anything is published.",
         "",
         f"- project: {proj.name} ({proj.url or 'no public url'})",
+        f"- brand: {proj.name}", f"- asset_id: {asset_id}", f"- keyword_cluster: {cluster_key}",
+        f"- hook_type: page_update", f"- campaign_id: {campaign}",
+        f"- why_now: page {page['last_status']} in latest crawl", "- evidence_ids: []",
         f"- page: {url}",
         f"- page title: {title}",
         f"- page description: {desc}",
@@ -2482,6 +2665,13 @@ def render_packet(proj: Project, page, cfg: dict, campaign: str, now: datetime) 
         "- [ ] link + UTM correct, no tracking on third-party sites",
         "- [ ] no personal data, no promises, no paid placement",
     ]
+    for ch in cfg.get("channels", []):
+        marker = f"## {ch}"
+        if marker in lines:
+            i = lines.index(marker) + 1
+            lines[i:i] = [f"- channel: {ch}",
+                          f"- why_this_channel: {_why_this_channel({'natural_channel': ch, 'language': 'ko'})}",
+                          f"- why_now: page {page['last_status']} in latest crawl", "- evidence_ids: []"]
     return "\n".join(lines) + "\n"
 
 
@@ -2527,6 +2717,180 @@ NEGATIVE_RE = re.compile(
     r"to\s+check\s*:|check\s+before|candidate", re.IGNORECASE)
 CITATION_RE = re.compile(
     r"confirmed\s+on|fact\s+source|cf\.|source\s*:", re.IGNORECASE)
+
+
+def parse_utm_attribution(url):
+    """Read explicit tracking only; a landing domain does not identify acquisition."""
+    url = _safe_http_url(url)
+    if not url:
+        return None
+    values = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    keys = ("utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_asset", "utm_term", "utm_brand")
+    result = {key: values[key][0].strip() for key in keys if values.get(key) and values[key][0].strip()}
+    return result if result.get("utm_source") else None
+
+
+def _metric_context(conn, entity, entity_id=None, post_id=None):
+    if entity not in ("site", "draft", "post"):
+        raise ValueError("invalid metric entity")
+    if entity_id is not None and (type(entity_id) is not int or entity_id <= 0):
+        raise ValueError("entity_id must be a positive integer")
+    if post_id is not None and (not isinstance(post_id, str) or not post_id.strip()):
+        raise ValueError("post_id must be non-empty text")
+    if post_id:
+        row = conn.execute("SELECT * FROM published WHERE post_id=?", (post_id,)).fetchone()
+        entity = "post"
+        if row is None or entity_id is not None and row["id"] != entity_id:
+            raise ValueError("unknown or conflicting post_id")
+    elif entity in ("draft", "post"):
+        table = "drafts" if entity == "draft" else "published"
+        row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (entity_id,)).fetchone()
+        if row is None:
+            raise ValueError("unknown metric entity")
+    elif entity == "site" and entity_id is None:
+        return {"entity": "site", "entity_id": None}
+    else:
+        raise ValueError("invalid metric entity")
+    context = {key: row[key] for key in ("asset_id", "keyword_cluster", "hook_type", "campaign_id")}
+    context.update(entity=entity, entity_id=row["id"], brand=row["project"],
+                   post_id=row["post_id"] if entity == "post" else None,
+                   channel=row["channel"] if entity == "post" else None)
+    return context
+
+
+def record_metric(conn, tier, metric, value, now, entity="site", entity_id=None, post_id=None,
+                  brand=None, source="manual", attribution=None, observed_at=None, window=None, note=None,
+                  asset_id=None, keyword_cluster=None, hook_type=None, channel=None, campaign_id=None):
+    """Store one observed aggregate, never convert missing values into zeroes.
+
+    Returns the new id, or None for an identical observation. Does not commit so a
+    collector can atomically save its check result and observations together.
+    """
+    if type(tier) is not int or tier not in TIER_METRICS or not isinstance(metric, str) or metric not in TIER_METRICS[tier]:
+        raise ValueError("metric is not valid for this tier")
+    if value is not None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("metric value must be a finite number or null")
+        if value < 0 and metric != "score":
+            raise ValueError("metric counts cannot be negative")
+        value = float(value)
+    observed = parse_iso(observed_at) if isinstance(observed_at, str) else observed_at
+    observed = now if observed_at is None else observed
+    if not isinstance(observed, datetime) or kst(observed) > kst(now):
+        raise ValueError("observed_at must be a valid, non-future ISO datetime")
+    if source not in ("manual", "json_import", "reddit_json"):
+        raise ValueError("invalid metric source")
+    for text in (brand, attribution, window, note, asset_id, keyword_cluster, hook_type, channel, campaign_id):
+        if text is not None and not isinstance(text, str):
+            raise ValueError("metric metadata must be text")
+    if entity_id is not None and type(entity_id) is not int:
+        raise ValueError("entity_id must be an integer")
+    ctx = _metric_context(conn, entity, entity_id, post_id)
+    provided = dict(brand=brand, asset_id=asset_id, keyword_cluster=keyword_cluster,
+                    hook_type=hook_type, channel=channel, campaign_id=campaign_id)
+    for key, val in provided.items():
+        if val and ctx.get(key) and val != ctx[key]:
+            raise ValueError(f"conflicting metric metadata: {key}")
+        if val:
+            ctx[key] = val
+    attribution = (attribution or "").strip() or DIRECT_UNKNOWN
+    row = {key: ctx.get(key) for key in ("brand", "entity", "entity_id", "post_id", "asset_id",
+                                        "keyword_cluster", "hook_type", "channel", "campaign_id")}
+    row.update(tier=tier, metric=metric, value=value, window=window, observed_at=iso(kst(observed)),
+               source=source, attribution=attribution, note=scrub_personal(note) if note else None)
+    # Brand and attribution prevent collisions between otherwise identical site observations.
+    row["dedupe_key"] = hashlib.sha1(json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    row["created"] = iso(now)
+    cur = conn.execute(f"INSERT OR IGNORE INTO metric_observations ({','.join(row)}) "
+                       f"VALUES ({','.join('?' for _ in row)})", tuple(row.values()))
+    return cur.lastrowid if cur.rowcount else None
+
+
+def import_metrics_dir(conn, cfg, projects, now):
+    result = {"imported": 0, "rejected": 0}
+    for proj in projects:
+        for raw in _input_rows(cfg, "metrics", proj):
+            try:
+                if not isinstance(raw, dict) or raw.get("project", proj.name) != proj.name:
+                    raise ValueError("invalid metric or project mismatch")
+                if not raw.get("observed_at") or "value" not in raw:
+                    raise ValueError("observed_at and value (number or null) are required")
+                entity = raw.get("entity", "site")
+                entity_id, post_id = raw.get("entity_id"), raw.get("post_id")
+                if post_id:
+                    entity = "post"
+                ctx = _metric_context(conn, entity, entity_id, post_id)
+                if ctx.get("brand") and ctx["brand"] != proj.name:
+                    raise ValueError("metric entity belongs to another brand")
+                explicit_brand = raw.get("brand")
+                if explicit_brand and explicit_brand != proj.name:
+                    raise ValueError("metric brand mismatch")
+                metadata = {key: raw.get(key) for key in ("asset_id", "keyword_cluster", "hook_type", "channel", "campaign_id")}
+                brand = ctx.get("brand") or explicit_brand
+                attribution = raw.get("attribution")
+                if attribution is None and ctx.get("channel"):
+                    attribution = ctx["channel"]
+                if raw.get("landing_url"):
+                    landing = _safe_http_url(raw["landing_url"])
+                    if not landing:
+                        raise ValueError("invalid landing_url")
+                    mapped, _ = map_project("", landing, cfg["_projects"])
+                    if mapped != proj.name:
+                        raise ValueError("landing_url must belong to the input brand")
+                    brand = brand or mapped
+                    utm = parse_utm_attribution(landing)
+                    if utm:
+                        if utm.get("utm_brand", proj.name) != proj.name:
+                            raise ValueError("UTM brand mismatch")
+                        if attribution is None:
+                            attribution = utm["utm_source"]
+                        for key, utm_key in (("channel", "utm_source"), ("asset_id", "utm_asset"),
+                                             ("keyword_cluster", "utm_term"), ("hook_type", "utm_content"),
+                                             ("campaign_id", "utm_campaign")):
+                            if metadata.get(key) and utm.get(utm_key) and metadata[key] != utm[utm_key]:
+                                raise ValueError("conflicting UTM metadata")
+                            metadata[key] = metadata.get(key) or utm.get(utm_key)
+                with conn:
+                    observation = record_metric(conn, raw.get("tier"), raw.get("metric"), raw["value"], now,
+                                                entity=ctx["entity"], entity_id=ctx["entity_id"], post_id=post_id,
+                                                brand=brand, source="json_import", attribution=attribution,
+                                                observed_at=raw["observed_at"], window=raw.get("window"),
+                                                note=raw.get("note"), **metadata)
+                result["imported"] += int(observation is not None)
+            except (ValueError, TypeError, OverflowError):
+                result["rejected"] += 1
+                log.warning("[metrics:%s] rejected invalid insight entry", proj.name)
+    return result
+
+
+def metrics_summary(conn, project=None):
+    """Per-brand counts/sums of observations, not deduplicated audience totals."""
+    result = {"brands": {}, "unattributed": 0}
+    sql = "SELECT * FROM metric_observations"
+    for row in conn.execute(sql + (" WHERE brand=?" if project is not None else ""),
+                            (project,) if project is not None else ()):
+        key = row["brand"] or DIRECT_UNKNOWN
+        brand = result["brands"].setdefault(key, {"tiers": {1: {}, 2: {}, 3: {}},
+                                                 "counts": {1: 0, 2: 0, 3: 0}, "unattributed": 0})
+        brand["counts"][row["tier"]] += 1
+        metric = brand["tiers"][row["tier"]].setdefault(row["metric"], {"count": 0, "known": 0, "sum": None})
+        metric["count"] += 1
+        if row["value"] is not None:
+            metric["known"] += 1
+            metric["sum"] = (metric["sum"] or 0) + row["value"]
+        if row["attribution"] == DIRECT_UNKNOWN:
+            brand["unattributed"] += 1
+            result["unattributed"] += 1
+    return result
+
+
+def _record_tier1_from_check(conn, pub_row, result, now):
+    if not result.get("checked") or not is_reddit_url(pub_row["url"] or ""):
+        return
+    for key, metric in (("score", "score"), ("num_comments", "comments")):
+        if result.get(key) is not None:
+            record_metric(conn, 1, metric, result[key], now, entity="post", entity_id=pub_row["pub_id"],
+                          source="reddit_json", attribution="reddit", window=pub_row["check_kind"])
 
 
 def _strip_trailing_punct(url: str) -> str:
@@ -2740,6 +3104,7 @@ def process_rounds_log(conn: sqlite3.Connection, cfg: dict, now: datetime) -> in
              dedupe, now_s, post_id, channel, iso(published_dt)))
         if cur.rowcount:
             added += 1
+    _backfill_content_metadata(conn, cfg)
     conn.commit()
     total = conn.execute("SELECT COUNT(*) AS n FROM published").fetchone()["n"]
     unmapped = conn.execute(
@@ -2811,17 +3176,18 @@ def run_due_checks(conn: sqlite3.Connection, fetcher: Fetcher, cfg: dict,
         status = "done" if checked else ("failed" if attempts >= max_attempts else "pending")
         retry_at = iso(now + timedelta(minutes=retry_minutes * attempts)) if status == "pending" else None
         failure_reason = None if checked else (result.get("reason") or "metric check unconfirmed")
-        conn.execute(
-            """
-            UPDATE metric_checks
-            SET status=?,
-                attempts = attempts + 1,
-                checked_at = ?,
-                result = ?, retry_at = ?, failure_reason = ?
-            WHERE id = ?
-            """, (status, iso(now), json.dumps(result, ensure_ascii=False), retry_at, failure_reason,
-                  row["check_id"]))
-        conn.commit()
+        with conn:
+            _record_tier1_from_check(conn, row, result, now)
+            conn.execute(
+                """
+                UPDATE metric_checks
+                SET status=?,
+                    attempts = attempts + 1,
+                    checked_at = ?,
+                    result = ?, retry_at = ?, failure_reason = ?
+                WHERE id = ?
+                """, (status, iso(now), json.dumps(result, ensure_ascii=False), retry_at, failure_reason,
+                      row["check_id"]))
         log.info("[metrics] %s %s %s -> %s", row["project"] or "unmapped",
                  row["check_kind"], row["url"] or row["label"],
                  _short_result(result))
@@ -2885,6 +3251,7 @@ def collect_status(conn: sqlite3.Connection, cfg: dict, now: datetime) -> dict:
     ensure_config_blockers(conn, cfg, now)  # config blockers always belong in the table
     since_7d = iso(now - timedelta(days=7))
     per_project = {}
+    insights = metrics_summary(conn)
     for proj in cfg["_projects"]:
         run = conn.execute(
             "SELECT * FROM crawl_runs WHERE project=? ORDER BY id DESC LIMIT 1",
@@ -2914,6 +3281,8 @@ def collect_status(conn: sqlite3.Connection, cfg: dict, now: datetime) -> dict:
             "candidates": cand_total, "candidates_7d": cand_7d,
             "drafts": drafts_n, "published": pub_n,
             "metrics": _metrics_cell(conn, proj.name),
+            "tier_metrics": insights["brands"].get(proj.name, {}).get("counts", {1: 0, 2: 0, 3: 0}),
+            "unattributed": insights["brands"].get(proj.name, {}).get("unattributed", 0),
             "questions": Counter({r["state"]: r["n"] for r in conn.execute(
                 "SELECT state,COUNT(*) AS n FROM questions WHERE project=? GROUP BY state", (proj.name,))}),
             "evidence": Counter({r["status"]: r["n"] for r in conn.execute(
@@ -2934,7 +3303,8 @@ def collect_status(conn: sqlite3.Connection, cfg: dict, now: datetime) -> dict:
         "SELECT COUNT(*) AS n FROM metric_checks WHERE status='failed'").fetchone()["n"]
     return {"projects": per_project, "global_blockers": global_blockers,
             "unmapped_published": unmapped, "next_due": next_due,
-            "pending_checks": pending, "failed_checks": failed}
+            "pending_checks": pending, "failed_checks": failed,
+            "unattributed": insights["unattributed"], "insights": insights}
 
 
 def _metrics_cell(conn: sqlite3.Connection, project: str) -> str:
@@ -2990,6 +3360,9 @@ def render_status_md(status: dict, cfg: dict, now: datetime, mode: str) -> str:
     for name, row in status["projects"].items():
         lines.append(f"- demand: {name} — questions {dict(row.get('questions', {}))}; "
                      f"evidence {dict(row.get('evidence', {}))}")
+        tiers = row.get("tier_metrics", {})
+        lines.append(f"- metrics: {name} — t1 n={tiers.get(1, 0)} t2 n={tiers.get(2, 0)} "
+                     f"t3 n={tiers.get(3, 0)} 미식별 n={row.get('unattributed', 0)}")
     lines += [
         "",
         "## notes",
@@ -3002,6 +3375,7 @@ def render_status_md(status: dict, cfg: dict, now: datetime, mode: str) -> str:
         f"- metric checks pending: {status['pending_checks']}"
         + (f", next due {fmt_kst(parse_iso(status['next_due']))}" if status["next_due"] else ""),
         f"- published entries not attributable to a project: {status['unmapped_published']}",
+        f"- {DIRECT_UNKNOWN}: {status.get('unattributed', 0)} metric observation(s)",
         f"- global blockers: {'; '.join(status['global_blockers']) if status['global_blockers'] else '없음'}",
         "",
         "rules honoured by this bot: robots.txt, 2-5 s random request sleep, "
@@ -3171,6 +3545,7 @@ def cmd_run(args) -> int:
         try:
             process_rounds_log(conn, cfg, now_kst())
             run_due_checks(conn, fetcher, cfg, now_kst())
+            import_metrics_dir(conn, cfg, projects, now_kst())
         except Exception as exc:
             log.exception("[metrics] failed: %s", type(exc).__name__)
 
@@ -3198,6 +3573,7 @@ def cmd_status(args) -> int:
     conn.commit()
     process_rounds_log(conn, cfg, now_kst())
     run_due_checks(conn, fetcher, cfg, now_kst())
+    import_metrics_dir(conn, cfg, cfg["_projects"], now_kst())
     write_status(conn, cfg, now_kst(), mode="status")
     if args.post:
         slack_text = open(abs_path(cfg, "status_slack"), encoding="utf-8").read()
@@ -3207,6 +3583,68 @@ def cmd_status(args) -> int:
     meta_set(conn, "last_status_at", iso(now_kst()))
     conn.close()
     return 0
+
+
+def cmd_queue(args) -> int:
+    cfg = load_config(args.config)
+    conn = db_connect(cfg)
+    now = now_kst()
+    try:
+        expire_evidence(conn, now)
+        conn.commit()
+        if args.action == "list":
+            projects = pick_projects(cfg, args.project) if args.project else [None]
+            rows = [row for proj in projects for row in queue_list(
+                conn, proj.name if proj else None, args.state, args.entity)]
+            print("entity | id | project | channel | state | asset_id | post_id | hold_reason")
+            for row in rows:
+                print(" | ".join(str(row.get(key) or "-") for key in
+                                 ("entity", "id", "project", "channel", "state", "asset_id", "post_id", "hold_reason")))
+        elif args.action == "move":
+            with conn:
+                transition(conn, args.entity, args.id, args.to, now, args.reason)
+            print(f"{args.entity} {args.id}: {args.to}")
+        else:
+            verified_at = parse_iso(args.verified_at) if args.verified_at else now
+            if verified_at is None:
+                raise ValueError("invalid verified-at ISO datetime")
+            mark_published_verified(conn, args.post_id, args.url, verified_at, now)
+            print(f"{args.post_id}: published_verified")
+        return 0
+    except ValueError as exc:
+        print(f"queue error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+
+def cmd_metrics(args) -> int:
+    cfg = load_config(args.config)
+    conn = db_connect(cfg)
+    try:
+        if args.action == "import":
+            result = import_metrics_dir(conn, cfg, pick_projects(cfg, args.project), now_kst())
+        elif args.action == "record":
+            value = None if args.value == "null" else float(args.value)
+            if args.brand and args.brand not in {p.name for p in cfg["_projects"]}:
+                raise ValueError("unknown brand")
+            with conn:
+                observation = record_metric(conn, args.tier, args.metric, value, now_kst(),
+                                            entity=args.entity, entity_id=args.id, post_id=args.post_id,
+                                            brand=args.brand, attribution=args.attribution,
+                                            observed_at=args.observed_at, window=args.window, note=args.note)
+            result = {"id": observation, "imported": int(observation is not None)}
+        else:
+            if args.project:
+                pick_projects(cfg, [args.project])
+            result = metrics_summary(conn, args.project)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 2 if result.get("rejected", 0) else 0
+    except (ValueError, TypeError) as exc:
+        print(f"metrics error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
 
 
 def cmd_daemon(args) -> int:
@@ -3246,6 +3684,43 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--post", action="store_true",
                     help="post out/status_slack.txt to Slack if a webhook is configured")
     st.set_defaults(func=cmd_status)
+
+    queue = sub.add_parser("queue", help="local approval queue (does not publish)")
+    queue.set_defaults(func=cmd_queue)
+    actions = queue.add_subparsers(dest="action", required=True)
+    listing = actions.add_parser("list", help="inspect drafts and posts")
+    listing.add_argument("--project", action="append")
+    listing.add_argument("--state", choices=POST_FLOW + HOLD_STATES)
+    listing.add_argument("--entity", choices=("draft", "post", "all"), default="all")
+    move = actions.add_parser("move", help="advance one step or put work on hold")
+    move.add_argument("--entity", choices=("draft", "post"), required=True)
+    move.add_argument("--id", type=int, required=True)
+    move.add_argument("--to", choices=POST_FLOW + HOLD_STATES, required=True)
+    move.add_argument("--reason", default="")
+    verify = actions.add_parser("verify", help="record a human-confirmed public URL")
+    verify.add_argument("--post-id", required=True)
+    verify.add_argument("--url", required=True)
+    verify.add_argument("--verified-at", help="ISO datetime of actual confirmation (default: now)")
+
+    metrics = sub.add_parser("metrics", help="local three-tier insights")
+    metrics.set_defaults(func=cmd_metrics)
+    actions = metrics.add_subparsers(dest="action", required=True)
+    importing = actions.add_parser("import", help="import data/metrics/<project>.json")
+    importing.add_argument("--project", action="append")
+    summary = actions.add_parser("summary", help="counts and sums of recorded observations")
+    summary.add_argument("--project")
+    recording = actions.add_parser("record", help="manually record one aggregate insight")
+    recording.add_argument("--tier", type=int, choices=(1, 2, 3), required=True)
+    recording.add_argument("--metric", required=True)
+    recording.add_argument("--value", required=True, help="number or null for unknown")
+    recording.add_argument("--entity", choices=("site", "draft", "post"), default="site")
+    recording.add_argument("--id", type=int)
+    recording.add_argument("--post-id")
+    recording.add_argument("--brand")
+    recording.add_argument("--attribution")
+    recording.add_argument("--observed-at", help="ISO datetime (default: now)")
+    recording.add_argument("--window", help="e.g. 48h, 7d, lifetime")
+    recording.add_argument("--note")
 
     dm = sub.add_parser("daemon", help="7-stage dev & blueprint-audit daemon (start/stop/restart/status/stages)")
     dm.add_argument("action", nargs="?", default="status",

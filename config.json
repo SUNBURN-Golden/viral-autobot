@@ -690,6 +690,9 @@
   "questions": {
     "dir": "data/questions"
   },
+  "metrics": {
+    "dir": "data/metrics"
+  },
   "hooks": {
     "types": [
       "loss_prevention",
