@@ -45,6 +45,7 @@ def make_cfg(tmp_dir, base_url=None, rounds_text=None, no_url=(), **over):
     os.makedirs(tmp_dir, exist_ok=True)
     cfg = ab.load_config(os.path.join(ROOT, "config.json"))
     cfg["paths"]["db"] = os.path.join(tmp_dir, "autobot.db")
+    cfg["paths"]["rules"] = os.path.join(tmp_dir, "rules.json")
     cfg["paths"]["logs"] = os.path.join(tmp_dir, "logs")
     cfg["paths"]["drafts"] = os.path.join(tmp_dir, "out", "drafts")
     cfg["paths"]["status_slack"] = os.path.join(tmp_dir, "out", "status_slack.txt")
@@ -1777,6 +1778,360 @@ def test_config_batch3(tmp_dir):
     conn.close()
 
 
+# ---- Batch 4
+
+def batch4_fixture(tmp_dir):
+    cfg = make_cfg(tmp_dir, rounds_text="")
+    cfg["paths"]["rules"] = os.path.join(tmp_dir, "rules.json")
+    cfg["metrics"]["dir"] = os.path.join(tmp_dir, "metrics")
+    now = datetime(2026, 1, 1, 10, tzinfo=ab.KST)
+    return cfg, ab.db_connect(cfg), now
+
+
+def batch4_post(conn, now, label, project="hanset", hook="loss_prevention", channel="threads",
+                target="https://hanset.soulbound.co.kr/sauna"):
+    # The ledger's identity is the landing URL, so distinct publications get IDs
+    # before assigning their common, controlled destination.
+    post_id = ab.record_post(conn, project, channel, target + "?publication=" + label, label, now, hook_type=hook)
+    ab.mark_published_verified(conn, post_id, "https://example.test/posts/" + label, now, now)
+    with conn:
+        conn.execute("UPDATE published SET target_url=? WHERE post_id=?", (target, post_id))
+    return post_id
+
+
+def batch4_metrics(conn, post_id, now, window="7d", **values):
+    mapping = {"reach": (2, "reach"), "clicks": (2, "link_clicks"), "engaged": (3, "resource_views"),
+               "signups": (3, "signups"), "revisits": (3, "revisits"), "views": (1, "views")}
+    with conn:
+        for name, value in values.items():
+            tier, metric = mapping[name]
+            ab.record_metric(conn, tier, metric, value, now, post_id=post_id, window=window)
+
+
+def batch4_experiment(conn, cfg, now, key, project="hanset", nums=(10, 5), early=(10, 5)):
+    units = [{"unit_key": "a", "variable_value": "loss_prevention"},
+             {"unit_key": "b", "variable_value": "discovery"}]
+    eid = ab.create_experiment(conn, cfg, project, key, "hook_type", "훅의 가입률 비교", units, now)
+    for i, unit in enumerate(units):
+        pid = batch4_post(conn, now + timedelta(days=1), key + unit["unit_key"], project, unit["variable_value"])
+        ab.attach_experiment_post(conn, cfg, eid, unit["unit_key"], pid, now + timedelta(days=1))
+        for window, counts in (("7d", nums), ("48h", early)):
+            batch4_metrics(conn, pid, now + timedelta(days=10), window,
+                           reach=1000, clicks=200, engaged=100, signups=counts[i], revisits=5)
+    return eid, ab.evaluate_experiment(conn, cfg, eid, now + timedelta(days=14))
+
+
+def test_experiment_create_batch4(tmp_dir):
+    cfg, conn, now = batch4_fixture(tmp_dir)
+    six = [{"unit_key": "u" + str(i), "variable_value": "channel" + str(i)} for i in range(6)]
+    eid = ab.create_experiment(conn, cfg, "hanset", "six", "channel", "채널 비교", six, now)
+    exp = ab.list_experiments(conn)[0]
+    check("batch4 experiment: six units over two weeks", len(ab.experiment_units_summary(conn, eid)) == 6 and
+          ab.parse_iso(exp["window_end"]) == now + timedelta(days=14))
+    for title, project, key, variable, hypothesis, units in [
+        ("seven", "goallit", "seven", "channel", "test", six + [{"unit_key": "u6", "variable_value": "ch6"}]),
+        ("duplicate value", "goallit", "dup", "channel", "test", [six[0], dict(six[0], unit_key="other")]),
+        ("duplicate key", "goallit", "dupkey", "channel", "test", [six[0], dict(six[1], unit_key="u0")]),
+        ("bad hook", "goallit", "hook", "hook_type", "test", [{"unit_key": "a", "variable_value": "fake"}]),
+        ("cta", "hanset", "cta", "cta", "test", six[:1]),
+        ("unknown brand", "fake", "brand", "channel", "test", six[:1]),
+        ("empty hypothesis", "goallit", "empty", "channel", " ", six[:1]),
+        ("same running lever", "hanset", "again", "channel", "test", six[:1]),
+    ]:
+        batch3_rejects("batch4 experiment rejects " + title, lambda p=project, k=key, v=variable, h=hypothesis, u=units:
+                       ab.create_experiment(conn, cfg, p, k, v, h, u, now))
+    hooks = [{"unit_key": str(i), "variable_value": value} for i, value in enumerate(ab.HOOK_TYPES)]
+    hook_id = ab.create_experiment(conn, cfg, "hanset", "hooks", "hook_type", "훅 비교", hooks, now)
+    check("batch4 experiment: different lever accepted", hook_id != eid)
+    first = batch4_post(conn, now, "first")
+    ab.attach_experiment_post(conn, cfg, hook_id, "0", first, now)
+    check("batch4 attach: valid", ab.experiment_units_summary(conn, hook_id)[0]["post_id"] == first)
+    bad_posts = {
+        "other brand": batch4_post(conn, now, "foreign", project="goallit", hook="unexpected_diff"),
+        "unknown post": "missing",
+        "outside window": batch4_post(conn, now - timedelta(days=1), "old", hook="unexpected_diff"),
+        "mismatch tested lever": batch4_post(conn, now, "mismatch", hook="discovery"),
+        "second variable": batch4_post(conn, now, "channel", hook="unexpected_diff", channel="reddit"),
+        "unknown control": batch4_post(conn, now, "unknown", hook="unexpected_diff", channel=ab.UNKNOWN),
+    }
+    for name, pid in bad_posts.items():
+        batch3_rejects("batch4 attach rejects " + name, lambda p=pid:
+                       ab.attach_experiment_post(conn, cfg, hook_id, "1", p, now))
+    valid = batch4_post(conn, now, "valid", hook="unexpected_diff")
+    ab.attach_experiment_post(conn, cfg, hook_id, "1", valid, now)
+    batch3_rejects("batch4 attach rejects occupied unit", lambda:
+                   ab.attach_experiment_post(conn, cfg, hook_id, "1", valid, now))
+    check("batch4 attach: normalized URL and KST controls", ab._post_levers(conn.execute(
+        "SELECT * FROM published WHERE post_id=?", (valid,)).fetchone())["posting_window"] == "morning")
+    rc, out, _ = batch3_cli(cfg, now, "experiments", "list", "--project", "hanset", "--status", "running")
+    check("batch4 CLI: experiment list", rc == 0 and len(json.loads(out)) == 2)
+    rc, out, _ = batch3_cli(cfg, now, "experiments", "evaluate", "--id", str(hook_id))
+    check("batch4 CLI: early evaluation", rc == 0 and json.loads(out)["verdict"] is None)
+    rc, _, _ = batch3_cli(cfg, now, "experiments", "attach", "--id", str(hook_id), "--unit", "missing", "--post-id", first)
+    check("batch4 CLI: attach error rc2", rc == 2)
+    for unit, expected in (("a=threads", 0), ("malformed", 2)):
+        rc, _, _ = batch3_cli(cfg, now, "experiments", "create", "--project", "goallit", "--key", unit,
+                              "--variable", "channel", "--hypothesis", "채널 비교", "--unit", unit)
+        check("batch4 CLI: create " + unit, rc == expected)
+    conn.close()
+
+
+def test_funnel_snapshots_batch4(tmp_dir):
+    cfg, conn, now = batch4_fixture(tmp_dir)
+    pid = batch4_post(conn, now, "snapshots")
+    batch4_metrics(conn, pid, now, reach=80)
+    batch4_metrics(conn, pid, now + timedelta(hours=1), reach=1200)
+    batch4_metrics(conn, pid, now + timedelta(hours=2), reach=None)
+    batch4_metrics(conn, pid, now, None, reach=9999)
+    batch4_metrics(conn, pid, now, "week", reach=8888)
+    batch4_metrics(conn, pid, now, "48h", views=500)
+    f = ab._funnel(conn, pid, "7d")
+    check("batch4 funnel: latest non-null not sum", f["impressions"] == 1200)
+    check("batch4 funnel: ignores unsupported windows", f["ignored_observations"] == 2)
+    check("batch4 funnel: missing remains null", f["clicks"] is None)
+    check("batch4 funnel: views fallback isolated by window", ab._funnel(conn, pid, "48h")["impressions"] == 500)
+    batch4_metrics(conn, pid, now + timedelta(hours=3), "48h", reach=0)
+    check("batch4 funnel: zero reach does not fall back", ab._funnel(conn, pid, "48h")["impressions"] == 0)
+    batch3_rejects("batch4 funnel: rejects invalid window", lambda: ab._funnel(conn, pid, "week"))
+    conn.close()
+
+
+def test_diagnosis_five_class_batch4(tmp_dir):
+    cfg, conn, now = batch4_fixture(tmp_dir)
+    base = dict(reach=1000, clicks=200, engaged=100, signups=40, revisits=10)
+    cases = [dict(reach=60), dict(clicks=10), dict(engaged=20), dict(engaged=60, signups=2), dict(revisits=2), {}]
+    for i, overrides in enumerate(cases):
+        pid = batch4_post(conn, now, "diag" + str(i))
+        data = dict(base, **overrides)
+        batch4_metrics(conn, pid, now, "48h", **data)
+        batch4_metrics(conn, pid, now, "7d", **data)
+        report = ab.diagnose_post(conn, cfg, pid, "48h", now)
+        check(f"batch4 diagnosis {i}: mandatory format", all(report[k] for k in
+              ("hypothesis", "actual_with_denominator", "next_single_change")) and "alternative_causes" in report)
+        expected = ab.FAILURE_CLASSES[i] if i < 5 else None
+        check(f"batch4 diagnosis {i}: class and alternatives", report["category"] == expected and
+              (bool(report["alternative_causes"]) if expected else report["verdict"] == "pass"))
+        if i == 0:
+            check("batch4 diagnosis: threshold denominator", "60 / 기준 100" in report["actual_with_denominator"] and
+                  report["denominator_kind"] == "threshold")
+        if i == 1:
+            check("batch4 diagnosis: CTR denominator", "10 / reach 1000" in report["actual_with_denominator"])
+        check(f"batch4 diagnosis {i}: measured state", conn.execute(
+            "SELECT state FROM published WHERE post_id=?", (pid,)).fetchone()[0] == "measured")
+        row_id = conn.execute("SELECT id FROM diagnoses WHERE post_id=?", (pid,)).fetchone()[0]
+        ab.diagnose_post(conn, cfg, pid, "48h", now)
+        check(f"batch4 diagnosis {i}: stable upsert ID", conn.execute(
+            "SELECT id FROM diagnoses WHERE post_id=?", (pid,)).fetchone()[0] == row_id)
+        ab.diagnose_post(conn, cfg, pid, "7d", now)
+        check(f"batch4 diagnosis {i}: evaluated state", conn.execute(
+            "SELECT state FROM published WHERE post_id=?", (pid,)).fetchone()[0] == "evaluated")
+    check("batch4 diagnosis: persistent reports", conn.execute("SELECT COUNT(*) FROM diagnoses").fetchone()[0] == 12)
+    conn.close()
+
+
+def test_judgment_hold_batch4(tmp_dir):
+    cfg, conn, now = batch4_fixture(tmp_dir)
+    cases = [(dict(reach=20), "low_impressions"), (dict(reach=200, clicks=10), "high_bounce"),
+             (dict(reach=1000, clicks=None), "low_ctr"),
+             (dict(reach=1000, clicks=200, engaged=100, signups=None), "low_signup"),
+             (dict(reach=1000, clicks=200, engaged=100, signups=40, revisits=None), "low_retention")]
+    for i, (data, category) in enumerate(cases):
+        pid = batch4_post(conn, now, "hold" + str(i))
+        batch4_metrics(conn, pid, now, **data)
+        report = ab.diagnose_post(conn, cfg, pid, "7d", now)
+        check(f"batch4 hold {i}: report and measured state", report["verdict"] == ab.JUDGMENT_HOLD and
+              report["category"] == category and "변경 없음" in report["next_single_change"] and
+              all(report[k] for k in ("hypothesis", "actual_with_denominator", "alternative_causes", "next_single_change")) and
+              conn.execute("SELECT state FROM published WHERE post_id=?", (pid,)).fetchone()[0] == "measured")
+    units = [{"unit_key": "a", "variable_value": "discovery"}]
+    eid = ab.create_experiment(conn, cfg, "hanset", "no-post", "hook_type", "test", units, now)
+    check("batch4 experiment hold: early writes nothing", ab.evaluate_experiment(conn, cfg, eid, now)["verdict"] is None and
+          conn.execute("SELECT result FROM experiments WHERE id=?", (eid,)).fetchone()[0] is None)
+    check("batch4 experiment hold: unattached counts", ab.evaluate_experiment(conn, cfg, eid, now + timedelta(days=14))["verdict"] == ab.JUDGMENT_HOLD)
+    eid = ab.create_experiment(conn, cfg, "hanset", "starved", "hook_type", "test", units, now)
+    pid = batch4_post(conn, now, "starved", hook="discovery")
+    ab.attach_experiment_post(conn, cfg, eid, "a", pid, now)
+    batch4_metrics(conn, pid, now, engaged=10, signups=2)
+    result = ab.evaluate_experiment(conn, cfg, eid, now + timedelta(days=14))
+    check("batch4 experiment hold: insufficient denominator listed", result["verdict"] == ab.JUDGMENT_HOLD and result["result"]["7d"]["a"]["den"] == 10)
+    batch4_metrics(conn, pid, now + timedelta(days=15), engaged=100, signups=10)
+    check("batch4 experiment: conclusion immutable", ab.evaluate_experiment(conn, cfg, eid, now + timedelta(days=16)) == result)
+    check("batch4 hold: no premature rules", conn.execute("SELECT COUNT(*) FROM brand_rules").fetchone()[0] == 0)
+    conn.close()
+
+
+def test_rules_promote_rollback_batch4(tmp_dir):
+    cfg, conn, now = batch4_fixture(tmp_dir)
+    late = now + timedelta(days=16)
+    held, _ = batch4_experiment(conn, cfg, now, "tied", nums=(10, 10))
+    mismatch, _ = batch4_experiment(conn, cfg, now, "mismatch", early=(5, 10))
+    winner, result = batch4_experiment(conn, cfg, now, "winner")
+    for name, project, value, source in [
+        ("held", "hanset", "loss_prevention", {"experiment_id": held}),
+        ("unconfirmed", "hanset", "loss_prevention", {"experiment_id": mismatch}),
+        ("other brand", "goallit", "loss_prevention", {"experiment_id": winner}),
+        ("wrong value", "hanset", "discovery", {"experiment_id": winner}),
+        ("fake evidence", "hanset", "loss_prevention", {"experiment_id": 9999}),
+        ("same confirmation", "hanset", "loss_prevention", {"experiment_id": mismatch, "confirm_experiment_id": mismatch}),
+    ]:
+        batch3_rejects("batch4 promotion rejects " + name, lambda p=project, v=value, s=source:
+                       ab.promote_rule(conn, cfg, p, "hook_type", v, late, s))
+    first = ab.promote_rule(conn, cfg, "hanset", "hook_type", "loss_prevention", late, {"experiment_id": winner})
+    check("batch4 promotion: window agreement v1", ab.active_rules(conn, "hanset")["hook_type"] == {"value": "loss_prevention", "version": 1})
+    with open(cfg["paths"]["rules"], encoding="utf-8") as fh:
+        check("batch4 promotion: project JSON", json.load(fh)["projects"]["hanset"]["hook_type"]["version"] == 1)
+    second = ab.promote_rule(conn, cfg, "hanset", "hook_type", "loss_prevention", late + timedelta(days=1),
+                             {"experiment_id": mismatch, "confirm_experiment_id": winner})
+    check("batch4 promotion: confirm experiment v2", ab.active_rules(conn, "hanset")["hook_type"]["version"] == 2 and
+          conn.execute("SELECT status FROM brand_rules WHERE id=?", (first,)).fetchone()[0] == "superseded")
+    foreign, _ = batch4_experiment(conn, cfg, now, "foreign", project="goallit")
+    ab.promote_rule(conn, cfg, "goallit", "hook_type", "loss_prevention", late, {"experiment_id": foreign})
+    check("batch4 rules: brand isolation", ab.active_rules(conn, "hanset")["hook_type"]["version"] == 2 and
+          ab.active_rules(conn, "goallit")["hook_type"]["version"] == 1)
+    rc, out, _ = batch3_cli(cfg, late, "rules", "list", "--project", "hanset")
+    check("batch4 CLI: rules list", rc == 0 and set(json.loads(out)) == {"hanset"})
+    rc, _, _ = batch3_cli(cfg, late, "rules", "promote", "--project", "hanset", "--key", "channel",
+                          "--value", "threads", "--experiment", str(winner))
+    check("batch4 CLI: invalid rule rc2", rc == 2)
+    rc, out, _ = batch3_cli(cfg, late, "rules", "rollback", "--project", "hanset", "--key", "hook_type", "--reason", "manual")
+    check("batch4 rollback: restores v1", rc == 0 and json.loads(out) == {"rolled_back": 2, "restored": 1} and
+          ab.active_rules(conn, "hanset")["hook_type"]["version"] == 1 and
+          conn.execute("SELECT status FROM brand_rules WHERE id=?", (second,)).fetchone()[0] == "rolled_back")
+    ab.rollback_rule(conn, cfg, "hanset", "hook_type", late, "last rule")
+    check("batch4 rollback: no previous version", ab.active_rules(conn, "hanset") == {})
+    with open(cfg["paths"]["rules"], encoding="utf-8") as fh:
+        payload = json.load(fh)
+    check("batch4 rollback: JSON updated and isolated", payload["projects"]["hanset"] == {} and payload["projects"]["goallit"]["hook_type"]["version"] == 1)
+    batch3_rejects("batch4 rollback: no active rule error", lambda: ab.rollback_rule(conn, cfg, "hanset", "hook_type", late))
+    conn.close()
+
+
+def test_rule_regression_batch4(tmp_dir):
+    cfg, conn, now = batch4_fixture(tmp_dir)
+    eid, _ = batch4_experiment(conn, cfg, now, "baseline")
+    promoted = now + timedelta(days=16)
+    for i in range(2):
+        ab.promote_rule(conn, cfg, "hanset", "hook_type", "loss_prevention", promoted + timedelta(days=i), {"experiment_id": eid})
+    post_time = promoted + timedelta(days=2)
+    pid = batch4_post(conn, post_time, "followup")
+    batch4_metrics(conn, pid, post_time, engaged=10, signups=1)
+    hold = ab.check_rule_regression(conn, cfg, "hanset", "hook_type", post_time)
+    check("batch4 regression: sample hold persisted", hold["verdict"] == ab.JUDGMENT_HOLD and
+          conn.execute("SELECT verdict FROM rule_checks ORDER BY id DESC LIMIT 1").fetchone()[0] == ab.JUDGMENT_HOLD and
+          ab.active_rules(conn, "hanset")["hook_type"]["version"] == 2)
+    batch4_metrics(conn, pid, post_time + timedelta(hours=1), engaged=100, signups=1)
+    regressed = ab.check_rule_regression(conn, cfg, "hanset", "hook_type", post_time + timedelta(hours=1))
+    check("batch4 regression: auto rollback", regressed["verdict"] == "regressed" and regressed["rolled_back"] ==
+          {"rolled_back": 2, "restored": 1} and ab.active_rules(conn, "hanset")["hook_type"]["version"] == 1)
+    # Latest snapshots replace the earlier low measurements.
+    batch4_metrics(conn, pid, post_time + timedelta(hours=2), engaged=100, signups=10)
+    healthy = ab.check_rule_regression(conn, cfg, "hanset", "hook_type", post_time + timedelta(hours=2))
+    check("batch4 regression: healthy rate", healthy["verdict"] == "ok" and healthy["actual_rate"] == .1)
+    foreign = batch4_post(conn, post_time, "foreignfollowup", project="goallit")
+    unknown = batch4_post(conn, post_time, "unknownfollowup")
+    different = batch4_post(conn, post_time, "differentfollowup", hook="discovery")
+    for p in (foreign, different):
+        batch4_metrics(conn, p, post_time, engaged=1000, signups=0)
+    batch4_metrics(conn, unknown, post_time, engaged=1000, signups=None)
+    rc, out, _ = batch3_cli(cfg, post_time + timedelta(hours=2), "rules", "check", "--project", "hanset", "--key", "hook_type")
+    check("batch4 regression: excludes foreign, different, unknown and pre-promotion posts", rc == 0 and
+          json.loads(out)["denominator"] == 100 and json.loads(out)["numerator"] == 10)
+    check("batch4 regression: no active rule", ab.check_rule_regression(conn, cfg, "goallit", "hook_type", post_time) == {"verdict": None})
+    conn.close()
+
+
+def test_config_batch4(tmp_dir):
+    cfg, conn, now = batch4_fixture(tmp_dir)
+    check("batch4 config: legacy defaults", cfg["experiments"]["max_units"] == 6 and
+          cfg["experiments"]["window_days"] == 14 and cfg["diagnosis"]["min_sample"] == 30 and
+          cfg["rules"]["regression_tolerance"] == .2 and cfg["paths"]["rules"].endswith("rules.json"))
+    pid = batch4_post(conn, now, "run")
+    for window in ab.METRIC_WINDOWS:
+        batch4_metrics(conn, pid, now, window, reach=1000, clicks=200, engaged=100, signups=40, revisits=10)
+    with conn:
+        conn.execute("UPDATE metric_checks SET status='done'")
+    flags = ("--no-crawl", "--no-discover", "--no-demand", "--no-drafts")
+    rc, _, _ = batch3_cli(cfg, now, "run", *flags, "--no-metrics")
+    check("batch4 integration: no-metrics gates diagnosis", rc == 0 and conn.execute("SELECT COUNT(*) FROM diagnoses").fetchone()[0] == 0)
+    rc, _, _ = batch3_cli(cfg, now, "run", *flags)
+    check("batch4 integration: run diagnoses both windows", rc == 0 and conn.execute("SELECT COUNT(*) FROM diagnoses").fetchone()[0] == 2)
+    check("batch4 integration: repeat diagnostics idempotent", ab.run_diagnostics(conn, cfg, cfg["_projects"], now) ==
+          dict(diagnosed=0, held=0, passed=0, evaluated=0, rule_checks=0, rolled_back=0))
+    pid2 = batch4_post(conn, now, "statushold")
+    batch4_metrics(conn, pid2, now, "48h", reach=20)
+    with conn:
+        conn.execute("UPDATE metric_checks SET status='done'")
+    rc, _, _ = batch3_cli(cfg, now, "status")
+    check("batch4 integration: status diagnoses holds", rc == 0 and conn.execute(
+          "SELECT verdict FROM diagnoses WHERE post_id=? AND check_kind='48h'", (pid2,)).fetchone()[0] == ab.JUDGMENT_HOLD)
+    status = ab.collect_status(conn, cfg, now)
+    check("batch4 status: diagnosis summaries", status["projects"]["hanset"]["diagnoses"]["pass"] == 2 and
+          "diagnosis: hanset" in ab.render_status_md(status, cfg, now, "test"))
+    conn.close()
+
+
+def test_evaluation_edges_batch4(tmp_dir):
+    cfg, conn, now = batch4_fixture(tmp_dir)
+    units = [{"unit_key": "a", "variable_value": "loss_prevention"},
+             {"unit_key": "b", "variable_value": "discovery"}]
+    eid = ab.create_experiment(conn, cfg, "hanset", "ctr-tie", "hook_type", "같은 가입률의 CTR 비교", units, now)
+    posts = []
+    for i, unit in enumerate(units):
+        pid = batch4_post(conn, now, "tie" + str(i), hook=unit["variable_value"])
+        posts.append(pid)
+        rc, _, _ = batch3_cli(cfg, now, "experiments", "attach", "--id", str(eid), "--unit", unit["unit_key"], "--post-id", pid)
+        check(f"batch4 CLI: successful attach {i}", rc == 0)
+        batch4_metrics(conn, pid, now, "7d", engaged=30, signups=3, reach=1000, clicks=100 + i * 100)
+        batch4_metrics(conn, pid, now, "48h", engaged=29 if i else 30, signups=3, reach=1000, clicks=100 + i * 100)
+    later = now + timedelta(days=14)
+    result = ab.evaluate_experiment(conn, cfg, eid, later)
+    check("batch4 evaluation: CTR tiebreak and sample boundary", result["verdict"] == "winner:b" and
+          result["result"]["winner_rate"] == .1 and result["result"]["48h"]["leader"] is None)
+    batch3_rejects("batch4 promotion: 48h sample shortage blocks revalidation", lambda:
+                   ab.promote_rule(conn, cfg, "hanset", "hook_type", "discovery", later, {"experiment_id": eid}))
+    batch3_rejects("batch4 attach: concluded experiment rejected", lambda:
+                   ab.attach_experiment_post(conn, cfg, eid, "a", posts[0], later))
+    # Latest tie at the exact same observed time uses the row ID as tiebreak.
+    batch4_metrics(conn, posts[0], now, "7d", clicks=300)
+    check("batch4 funnel: identical time ordered by ID", ab._funnel(conn, posts[0], "7d")["clicks"] == 300)
+    confirm, _ = batch4_experiment(conn, cfg, now, "confirm", nums=(5, 10))
+    rc, out, _ = batch3_cli(cfg, later, "rules", "promote", "--project", "hanset", "--key", "hook_type",
+                          "--value", "discovery", "--experiment", str(eid), "--confirm-experiment", str(confirm))
+    check("batch4 CLI: promotion succeeds with confirmation", rc == 0 and json.loads(out)["id"] > 0)
+    # Diagnostics only process selected brands and completed check rows, and also
+    # conclude due experiments and check active rules during the same run.
+    pending = batch4_post(conn, now, "pending")
+    foreign = batch4_post(conn, now, "foreigncheck", project="goallit")
+    with conn:
+        conn.execute("UPDATE metric_checks SET status='done' WHERE published_id IN "
+                     "(SELECT id FROM published WHERE post_id=?)", (foreign,))
+    due_id = ab.create_experiment(conn, cfg, "hanset", "due", "channel", "test",
+                                  [{"unit_key": "a", "variable_value": "threads"}], now)
+    selected = [p for p in cfg["_projects"] if p.name == "hanset"]
+    report = ab.run_diagnostics(conn, cfg, selected, later)
+    check("batch4 diagnostics: due evaluation and rule check", report["evaluated"] == 1 and report["rule_checks"] == 1 and
+          conn.execute("SELECT verdict FROM experiments WHERE id=?", (due_id,)).fetchone()[0] == ab.JUDGMENT_HOLD)
+    check("batch4 diagnostics: pending and foreign excluded", conn.execute(
+          "SELECT COUNT(*) FROM diagnoses WHERE post_id IN (?,?)", (pending, foreign)).fetchone()[0] == 0)
+    # A completed diagnosis links back to its experiment without recreating IDs.
+    diagnosis = ab.diagnose_post(conn, cfg, posts[0], "7d", later)
+    check("batch4 diagnosis: experiment linked", conn.execute(
+          "SELECT experiment_id FROM diagnoses WHERE post_id=?", (posts[0],)).fetchone()[0] == eid)
+    # Reopening an existing ledger preserves all five new tables and their rows.
+    conn.close()
+    conn = ab.db_connect(cfg)
+    check("batch4 schema: repeated initialization preserves rules", ab.active_rules(conn, "hanset")["hook_type"]["value"] == "discovery")
+    try:
+        with conn:
+            conn.execute("INSERT INTO experiment_units (experiment_id,unit_key,variable_value,created) VALUES (?,?,?,?)",
+                         (eid, "duplicate", "discovery", ab.iso(now)))
+    except sqlite3.IntegrityError:
+        check("batch4 schema: duplicate value constrained", True)
+    else:
+        check("batch4 schema: duplicate value constrained", False)
+    conn.close()
+
+
 def main():
     import tempfile
     print("offline tests for autobot.py")
@@ -1792,6 +2147,14 @@ def main():
     urllib.request.urlopen = local_urlopen
     server = start_server()
     try:
+        test_experiment_create_batch4(tempfile.mkdtemp(prefix="ab-batch4-create-"))
+        test_funnel_snapshots_batch4(tempfile.mkdtemp(prefix="ab-batch4-funnel-"))
+        test_diagnosis_five_class_batch4(tempfile.mkdtemp(prefix="ab-batch4-diagnose-"))
+        test_judgment_hold_batch4(tempfile.mkdtemp(prefix="ab-batch4-hold-"))
+        test_rules_promote_rollback_batch4(tempfile.mkdtemp(prefix="ab-batch4-rules-"))
+        test_rule_regression_batch4(tempfile.mkdtemp(prefix="ab-batch4-regression-"))
+        test_config_batch4(tempfile.mkdtemp(prefix="ab-batch4-config-"))
+        test_evaluation_edges_batch4(tempfile.mkdtemp(prefix="ab-batch4-edges-"))
         test_channel_formats_batch3(tempfile.mkdtemp(prefix="ab-batch3-formats-"))
         test_approval_queue(tempfile.mkdtemp(prefix="ab-batch3-queue-"))
         test_metrics_three_tiers(tempfile.mkdtemp(prefix="ab-batch3-metrics-"))
