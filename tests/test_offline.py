@@ -1026,6 +1026,441 @@ def test_post_id_state_machine(tmp_dir):
     conn.close()
 
 
+# ---------------------------------------------------------------- Batch 2
+
+def batch2_fixture(tmp_dir):
+    cfg = make_cfg(tmp_dir)
+    cfg["evidence"]["dir"] = os.path.join(tmp_dir, "evidence")
+    cfg["questions"]["dir"] = os.path.join(tmp_dir, "questions")
+    now = ab.kst(datetime(2026, 10, 23, 12))
+    proj = cfg["_projects"][0]
+    conn = ab.db_connect(cfg)
+    landing = proj.url + "/guides/sauna-day-pass"
+    conn.execute("INSERT INTO pages (project,url,first_seen,last_seen,last_changed,title) VALUES (?,?,?,?,?,?)",
+                 (proj.name, landing, ab.iso(now), ab.iso(now), ab.iso(now), "Fixture sauna guide"))
+    raw_q = {"project": proj.name, "question": "Which sauna day pass permits entry?",
+             "keyword_cluster": "sauna-day-pass", "source": "search_console", "source_refs": [],
+             "persona_decision": "A visitor decides which day pass to choose",
+             "why_now": "Fixture search query observed today", "unique_evidence": "Fixture verified entry condition",
+             "natural_channel": "reddit", "target_landing_url": landing}
+    raw_e = {"id": "fixture-entry", "project": proj.name, "keyword_cluster": "sauna-day-pass",
+             "keywords": ["sauna", "day pass"], "kind": "entry_condition",
+             "fact": "Fixture fact for offline tests; not a real venue claim",
+             "source_url": "https://official.example.test/conditions",
+             "verified_at": ab.iso(now - timedelta(days=1)), "valid_until": ab.iso(now + timedelta(days=10)),
+             "allowed_claims": ["Fixture entry requires checking the booking conditions"],
+             "forbidden_claims": ["Fixture unrestricted entry"]}
+    return cfg, conn, proj, now, raw_q, raw_e
+
+
+def batch2_write(cfg, section, project, rows):
+    os.makedirs(cfg[section]["dir"], exist_ok=True)
+    with open(os.path.join(cfg[section]["dir"], project + ".json"), "w", encoding="utf-8") as fh:
+        json.dump(rows, fh, ensure_ascii=False)
+
+
+def batch2_question(conn, cfg, proj, raw, now):
+    rec, errors = ab.normalize_question(raw, proj, cfg["_projects"], cfg)
+    assert not errors, errors
+    return ab.upsert_question(conn, rec, now)
+
+
+def batch2_evidence(conn, proj, raw, now):
+    rec, errors = ab.validate_evidence(raw, proj, now)
+    assert not errors, errors
+    return ab.upsert_evidence(conn, rec, now)
+
+
+def test_question_candidates(tmp_dir):
+    cfg, conn, proj, now, raw, _ = batch2_fixture(tmp_dir)
+    for field in ("persona_decision", "why_now", "unique_evidence", "natural_channel", "target_landing_url"):
+        missing = dict(raw)
+        missing.pop(field)
+        _, errors = ab.normalize_question(missing, proj, cfg["_projects"], cfg)
+        check("question: required " + field, "missing:" + field in errors, str(errors))
+    for url, reason in ((proj.url, "main_page"), (proj.url + "/index.html?x=1", "main_page"),
+                        (proj.url + "/a/../", "main_page"),
+                        ("https://pitchboard.soulbound.co.kr/calls/a", "other_brand"),
+                        ("https://external.test/guides/a", "external_domain"),
+                        ("javascript:alert(1)", "invalid_url")):
+        _, errors = ab.normalize_question(dict(raw, target_landing_url=url), proj, cfg["_projects"], cfg)
+        check("question: landing rejects " + reason + url, "landing:" + reason in errors, str(errors))
+    for value, source, expected in ((None, None, "검색량 미확인"), ("1200", None, "검색량 미확인"),
+                                    ("1200", "Fixture search console export", "1200")):
+        rec, errors = ab.normalize_question(dict(raw, search_volume_status=value, search_volume_source=source),
+                                             proj, cfg["_projects"], cfg)
+        check("question: volume provenance " + str(source) + str(value), rec["search_volume_status"] == expected)
+    rec, _ = ab.normalize_question(dict(raw, author="private-id", username="secret", email="secret@example.test",
+                                       question="Which sauna for u/someone @private contact@example.test?",
+                                       source_refs=[{"author": "private-id"}, "https://reddit.com/user/private-id", 1,
+                                                    "https://www.reddit.com/r/travel/comments/abc/?author=secret"]),
+                                   proj, cfg["_projects"], cfg)
+    stored = json.dumps(rec)
+    check("question: personal fields and inline identifiers removed",
+          not any(v in stored for v in ("private-id", "someone", "contact@", "@private", "secret")), stored)
+    qid = ab.upsert_question(conn, rec, now)
+    same = ab.upsert_question(conn, dict(rec, source_refs=[2, 1]), now + timedelta(hours=1))
+    row = conn.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+    check("question: stable upsert merges refs and preserves first_seen", same == qid and
+          row["first_seen"] == ab.iso(now) and row["last_seen"] == ab.iso(now + timedelta(hours=1)) and
+          set(v for v in json.loads(row["source_refs"]) if type(v) is int) == {1, 2})
+    check("question: no personal columns", not ab.PERSONAL_KEYS.intersection(row.keys()))
+    scored = ab.score_question(rec, proj, cfg, 9, {"count": 4, "latest": ab.iso(now)}, now)
+    keys = ("demand", "intent", "brand_fit", "evidence", "timeliness")
+    check("question: score range and weighted priority", all(0 <= scored["score_" + k] <= 3 for k in keys) and
+          abs(scored["priority"] - sum(scored["score_" + k] * cfg["demand"]["priority_weights"][k] for k in keys)) < .000001)
+    for count, score in ((0, 0), (1, 1), (2, 2), (3, 2), (4, 3)):
+        result = ab.score_question(dict(rec, source="reddit"), proj, cfg, 0, {"count": count}, now)
+        check("question: demand distinct-thread scale " + str(count), result["score_demand"] == score)
+    confirmed = ab.score_question(dict(rec, source="manual", search_volume_status="1200",
+                                       search_volume_source="Fixture export"), proj, cfg, 0, {}, now)
+    unknown = ab.score_question(dict(rec, source="manual", search_volume_status="1200",
+                                    search_volume_source=None), proj, cfg, 0, {}, now)
+    check("question: only confirmed positive volume indicates demand", confirmed["score_demand"] == 1 and unknown["score_demand"] == 0)
+    payload = {"data": {"children": [
+        {"data": {"permalink": f"/r/travel/comments/fixture{i}/", "title": "Which sauna day pass? u/private-id",
+                  "author": "private-id", "created_utc": (now - timedelta(days=1)).timestamp(), "subreddit": "travel"}}
+        for i in range(3)]}}
+    ab._store_reddit_candidates(conn, proj.name, "sauna day pass", json.dumps(payload).encode(), ab.iso(now))
+    result = ab.questions_from_candidates(conn, cfg, [proj], now)
+    rows = conn.execute("SELECT * FROM questions WHERE source='reddit'").fetchall()
+    check("question: reddit metadata clustered with actual counts", result["created"] == 1 and len(rows) == 1 and
+          "3 public questions" in rows[0]["why_now"] and len(json.loads(rows[0]["source_refs"])) == 6)
+    check("question: source titles scrubbed before persistence", "private-id" not in str([
+        dict(r) for r in conn.execute("SELECT * FROM candidates")]))
+    check("question: cluster upsert idempotent", ab.questions_from_candidates(conn, cfg, [proj], now)["created"] == 0)
+    check("question: author profile URLs never stored", not ab._store_candidate(
+        conn, proj.name, "sauna", "reddit", "https://reddit.com/user/private-id", "sauna", None,
+        now.timestamp(), 0, 0, ab.iso(now)))
+    # A fresh observation of an old thread is not fresh demand.
+    conn.execute("UPDATE candidates SET created_utc=?", (ab.iso(now - timedelta(days=30)),))
+    stats = ab._question_thread_stats(conn, rows[0], cfg, now)
+    check("question: old threads excluded from demand", stats["count"] == 0)
+    conn.close()
+
+
+def test_evidence_validation(tmp_dir):
+    cfg, conn, proj, now, _, raw = batch2_fixture(tmp_dir)
+    for field in ("fact", "source_url", "verified_at", "valid_until", "allowed_claims", "forbidden_claims"):
+        missing = dict(raw)
+        missing.pop(field)
+        _, errors = ab.validate_evidence(missing, proj, now)
+        check("evidence: required " + field, "missing:" + field in errors, str(errors))
+    cases = [(dict(raw, valid_until=raw["verified_at"]), "invalid:valid_until"),
+             (dict(raw, verified_at=ab.iso(now + timedelta(days=1))), "invalid:verified_at"),
+             (dict(raw, verified_at="not-a-date"), "invalid:verified_at"),
+             (dict(raw, valid_until=42), "invalid:valid_until"),
+             (dict(raw, source_url="file:///tmp/fact"), "invalid:source_url"),
+             (dict(raw, source_url={"url": "https://example.test"}), "invalid:source_url"),
+             (dict(raw, source_url="https://private:secret@example.test/fact"), "invalid:source_url"),
+             (dict(raw, allowed_claims=[]), "missing:allowed_claims"),
+             (dict(raw, forbidden_claims=None), "invalid:forbidden_claims"),
+             (dict(raw, allowed_claims="untyped string"), "invalid:allowed_claims"),
+             (dict(raw, forbidden_claims=raw["allowed_claims"]), "conflict:claims"),
+             (dict(raw, allowed_claims=["무조건 확인"]), "banned:allowed_claims"),
+             (dict(raw, project="pitchboard"), "project:mismatch")]
+    for i, (case, expected) in enumerate(cases):
+        _, errors = ab.validate_evidence(case, proj, now)
+        check("evidence: invalid case " + str(i), expected in errors, str(errors))
+    eid = batch2_evidence(conn, proj, raw, now)
+    check("evidence: stable upsert", eid == batch2_evidence(conn, proj, raw, now + timedelta(hours=1)) and
+          conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 1)
+    batch2_write(cfg, "evidence", proj.name, {"project": "pitchboard", "evidence": [raw]})
+    check("evidence: mismatched file rejected", ab.import_evidence_dir(conn, cfg, [proj], now) == {"imported": 0, "rejected": 1})
+    batch2_write(cfg, "evidence", proj.name, [dict(raw, project="pitchboard"), raw])
+    check("evidence: bad item does not prevent valid import", ab.import_evidence_dir(conn, cfg, [proj], now) == {"imported": 1, "rejected": 1})
+    with open(os.path.join(cfg["evidence"]["dir"], proj.name + ".json"), "w") as fh:
+        fh.write("{not json")
+    check("evidence: malformed input rejected", ab.import_evidence_dir(conn, cfg, [proj], now)["rejected"] == 1)
+    conn.close()
+
+
+def test_evidence_expiry(tmp_dir):
+    cfg, conn, proj, now, qraw, eraw = batch2_fixture(tmp_dir)
+    qid = batch2_question(conn, cfg, proj, qraw, now)
+    eid = batch2_evidence(conn, proj, eraw, now)
+    ab.link_evidence(conn, eid, "question", qid)
+    conn.execute("UPDATE questions SET state='drafted' WHERE id=?", (qid,))
+    draft = conn.execute("INSERT INTO drafts (project,page_url,path,channels,created,question_id) VALUES (?,?,?,?,?,?)",
+                         (proj.name, "question:fixture", "fixture.md", "threads", ab.iso(now), qid)).lastrowid
+    ab.link_evidence(conn, eid, "draft", draft)
+    planned = ab.record_post(conn, proj.name, "threads", qraw["target_landing_url"], "fixture", now, evidence_ids=[eid])
+    verified = ab.record_post(conn, proj.name, "x", qraw["target_landing_url"], "fixture", now, evidence_ids=[eid])
+    ab.mark_published_verified(conn, verified, "https://example.test/public-fixture", now, now)
+    before = conn.execute("SELECT COUNT(*) FROM post_events").fetchone()[0]
+    expired_now = now + timedelta(days=11)
+    # Every date comparison uses instants, not lexicographic offsets.
+    conn.execute("UPDATE evidence SET valid_until=? WHERE id=?", (ab.iso(expired_now - timedelta(seconds=1)), eid))
+    conn.commit()
+    result = ab.expire_evidence(conn, expired_now)
+    check("expiry: draft and scheduled post held; question reopened", result == {"expired": 1, "held": 2, "questions_reopened": 1}, str(result))
+    check("expiry: evidence status expired", conn.execute("SELECT status FROM evidence WHERE id=?", (eid,)).fetchone()[0] == "expired")
+    draft_row = conn.execute("SELECT * FROM drafts WHERE id=?", (draft,)).fetchone()
+    post = conn.execute("SELECT * FROM published WHERE post_id=?", (planned,)).fetchone()
+    check("expiry: reasons include evidence key", all(r["state"] == "expired_hold" and eraw["id"] in r["hold_reason"]
+          for r in (draft_row, post)))
+    check("expiry: verified post preserved", conn.execute("SELECT state FROM published WHERE post_id=?", (verified,)).fetchone()[0] == "published_verified")
+    check("expiry: exactly two audited holds", conn.execute("SELECT COUNT(*) FROM post_events").fetchone()[0] == before + 2)
+    check("expiry: question needs research", conn.execute("SELECT state FROM questions WHERE id=?", (qid,)).fetchone()[0] == "needs_research")
+    check("expiry: repeat makes no changes", ab.expire_evidence(conn, expired_now) == {"expired": 0, "held": 0, "questions_reopened": 0})
+    before_posts = conn.execute("SELECT COUNT(*) FROM published").fetchone()[0]
+    try:
+        ab.record_post(conn, proj.name, "instagram", qraw["target_landing_url"], "expired", expired_now, evidence_ids=[eid])
+        rejected = False
+    except ValueError:
+        rejected = True
+    check("expiry: expired evidence cannot schedule a new post", rejected and
+          conn.execute("SELECT COUNT(*) FROM published").fetchone()[0] == before_posts)
+    # Reimporting the same expired JSON must not reactivate it.
+    batch2_write(cfg, "evidence", proj.name, [dict(eraw, valid_until=ab.iso(expired_now - timedelta(seconds=1)))])
+    ab.import_evidence_dir(conn, cfg, [proj], expired_now)
+    check("expiry: expired reimport stays expired", ab.expire_evidence(conn, expired_now)["expired"] == 0)
+    # The whole expiry pass, including its audit event, rolls back on failure.
+    fresh = batch2_evidence(conn, proj, dict(eraw, id="atomic", valid_until=ab.iso(expired_now + timedelta(days=1))), now)
+    d2 = conn.execute("INSERT INTO drafts(project,page_url,path,channels,created) VALUES(?,?,?,?,?)",
+                      (proj.name, "question:atomic", "fixture.md", "threads", ab.iso(now))).lastrowid
+    ab.link_evidence(conn, fresh, "draft", d2)
+    conn.execute("CREATE TEMP TRIGGER reject_expiry BEFORE INSERT ON post_events BEGIN SELECT RAISE(ABORT,'fixture'); END")
+    conn.commit()
+    try:
+        ab.expire_evidence(conn, expired_now + timedelta(days=2))
+        rejected = False
+    except sqlite3.IntegrityError:
+        rejected = True
+    check("expiry: transaction rolls back evidence and entity", rejected and conn.execute(
+        "SELECT status FROM evidence WHERE id=?", (fresh,)).fetchone()[0] == "active" and conn.execute(
+        "SELECT state FROM drafts WHERE id=?", (d2,)).fetchone()[0] == "candidate")
+    conn.execute("DROP TRIGGER reject_expiry")
+    conn.close()
+
+
+def test_needs_research_and_no_demand(tmp_dir):
+    cfg, conn, proj, now, qraw, eraw = batch2_fixture(tmp_dir)
+    qid = batch2_question(conn, cfg, proj, qraw, now)
+    ab.run_demand_pipeline(conn, cfg, [proj], now)
+    q = conn.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+    check("research: missing evidence holds question", q["state"] == "needs_research" and q["hold_reason"] == "no_verified_evidence")
+    check("research: no draft rows or files", ab.generate_question_drafts(conn, cfg, [proj], now) == 0 and
+          conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0] == 0 and not os.path.exists(cfg["paths"]["drafts"]))
+    batch2_write(cfg, "evidence", proj.name, [eraw])
+    ab.run_demand_pipeline(conn, cfg, [proj], now)
+    check("research: supplied evidence makes ready", conn.execute("SELECT state FROM questions WHERE id=?", (qid,)).fetchone()[0] == "ready")
+    conn.execute("UPDATE questions SET target_landing_url=NULL WHERE id=?", (qid,))
+    ab.classify_questions(conn, cfg, [proj], now)
+    q = conn.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+    check("research: missing landing holds question", q["state"] == "needs_research" and q["hold_reason"] == "landing_missing")
+    # Recovery resolves only actual crawled pages.
+    ab.run_demand_pipeline(conn, cfg, [proj], now)
+    check("research: live deep landing resolved", conn.execute("SELECT target_landing_url FROM questions WHERE id=?", (qid,)).fetchone()[0] == qraw["target_landing_url"])
+    # Evidence with no demand remains on hold, then recovers when observed demand arrives.
+    q2raw = dict(qraw, source="manual", question="Where is the fixture second sauna?", keyword_cluster="fixture-second")
+    q2id = batch2_question(conn, cfg, proj, q2raw, now)
+    e2raw = dict(eraw, id="fixture-second", keyword_cluster="fixture-second", keywords=["fixture second"])
+    eid = batch2_evidence(conn, proj, e2raw, now)
+    # Prevent broad first-cluster keyword matches so this evidence has no other demand.
+    conn.execute("UPDATE questions SET question='Fixture second option' WHERE id=?", (q2id,))
+    ab.run_demand_pipeline(conn, cfg, [proj], now)
+    check("demand: question without observations held", conn.execute("SELECT state FROM questions WHERE id=?", (q2id,)).fetchone()[0] == "no_demand_hold")
+    check("demand: evidence without demand held", conn.execute("SELECT status FROM evidence WHERE id=?", (eid,)).fetchone()[0] == "no_demand_hold")
+    conn.execute("UPDATE questions SET source='search_console' WHERE id=?", (q2id,))
+    ab.run_demand_pipeline(conn, cfg, [proj], now)
+    check("demand: evidence and question recover", conn.execute("SELECT status FROM evidence WHERE id=?", (eid,)).fetchone()[0] == "active" and
+          conn.execute("SELECT state FROM questions WHERE id=?", (q2id,)).fetchone()[0] == "ready")
+    e3 = batch2_evidence(conn, proj, dict(eraw, id="unmatched", keywords=[], keyword_cluster="unmatched"), now)
+    ab.hold_evidence_without_demand(conn, now)
+    check("demand: unlinked evidence held", conn.execute("SELECT status FROM evidence WHERE id=?", (e3,)).fetchone()[0] == "no_demand_hold")
+    conn.execute("INSERT INTO crawl_runs(started,project,first_run) VALUES(?,?,0)", (ab.iso(now), proj.name))
+    unused = proj.url + "/guides/no-demand"
+    conn.execute("INSERT INTO pages(project,url,first_seen,last_seen,last_changed,title) VALUES(?,?,?,?,?,?)",
+                 (proj.name, unused, ab.iso(now), ab.iso(now), ab.iso(now), "No demand fixture"))
+    ab.generate_drafts(conn, cfg, [proj], now, ab.iso(now))
+    row = conn.execute("SELECT * FROM drafts WHERE page_url=?", (unused,)).fetchone()
+    check("demand: page draft held but packet retained", row["state"] == "no_demand_hold" and os.path.exists(row["path"]))
+    before = conn.execute("SELECT COUNT(*) FROM post_events").fetchone()[0]
+    ab.generate_drafts(conn, cfg, [proj], now, ab.iso(now))
+    check("demand: page hold is idempotent", conn.execute("SELECT COUNT(*) FROM post_events").fetchone()[0] == before)
+    conn.close()
+
+
+def test_hooks(tmp_dir):
+    cfg, conn, proj, now, qraw, eraw = batch2_fixture(tmp_dir)
+    qid = batch2_question(conn, cfg, proj, qraw, now)
+    eid = batch2_evidence(conn, proj, eraw, now)
+    q = conn.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+    evidence = conn.execute("SELECT * FROM evidence WHERE id=?", (eid,)).fetchone()
+    hooks = ab.generate_hooks(q, [evidence], proj, cfg)
+    ab.store_hooks(conn, qid, hooks, now)
+    ab.store_hooks(conn, qid, hooks, now)
+    check("hooks: exact three types with idempotent storage", set(hooks) == set(ab.HOOK_TYPES) and
+          conn.execute("SELECT COUNT(*) FROM hooks WHERE question_id=?", (qid,)).fetchone()[0] == 3)
+    check("hooks: all ok use approved claims only", all(h["status"] == "ok" and eraw["allowed_claims"][0] in h["text"] and
+          eraw["fact"] not in h["text"] and not ab.find_banned_terms(h["text"]) for h in hooks.values()))
+    check("hooks: three angles differ", len({h["text"] for h in hooks.values()}) == 3)
+    check("hooks: whitespace bait variants detected", set(ab.find_banned_terms("충격! 아무도모르는 무조건")) == {"충격", "아무도 모르는", "무조건"})
+    check("hooks: english casefold bait detected", "shocking" in ab.find_banned_terms("SHOCKING"))
+    baitq = dict(q, question="충격! 아무도모르는 무조건 sauna", language="ko")
+    blocked = ab.generate_hooks(baitq, [evidence], proj, cfg)
+    check("hooks: bait blocks all angles with reasons", all(h["status"] == "blocked" and "충격" in h["blocked_terms"] for h in blocked.values()))
+    forbidden_q = dict(q, question="Fixture unrestricted entry", language="en")
+    forbidden_e = dict(evidence, forbidden_claims=json.dumps(["unrestricted"]))
+    check("hooks: evidence forbidden claims blocked", all(h["status"] == "blocked" for h in ab.generate_hooks(forbidden_q, [forbidden_e], proj, cfg).values()))
+    check("hooks: English template chosen", hooks["loss_prevention"]["text"].startswith("Before deciding"))
+    ko = ab.generate_hooks(dict(q, question="사우나 당일 준비물", language="ko"), [evidence], proj, cfg)
+    check("hooks: Korean template chosen", "확인해요" in ko["loss_prevention"]["text"])
+    for name, term in (("agamajung", "최저가"), ("kitchengenome", "제자")):
+        brand = next(p for p in cfg["_projects"] if p.name == name)
+        own = dict(evidence, project=name)
+        out = ab.generate_hooks(dict(q, project=name, question=term + " 조건", language="ko"), [own], brand, cfg)
+        check("hooks: brand term blocked " + name, all(h["status"] == "blocked" and term in h["blocked_terms"] for h in out.values()))
+    kitchen = next(p for p in cfg["_projects"] if p.name == "kitchengenome")
+    permitted = dict(evidence, project=kitchen.name, allowed_claims=json.dumps(["Fixture 제자 관계 확인"]))
+    check("hooks: sourced mentorship exception", all(h["status"] == "ok" for h in ab.generate_hooks(
+        dict(q, project=kitchen.name, question="셰프 경력", language="ko"), [permitted], kitchen, cfg).values()))
+    foreign = dict(evidence, project="pitchboard")
+    check("hooks: another brand cannot supply claim", all(h["status"] == "blocked" and not h["evidence_ids"] for h in ab.generate_hooks(q, [foreign], proj, cfg).values()))
+    other = next(p for p in cfg["_projects"] if p.name == "pitchboard")
+    other_eid = batch2_evidence(conn, other, dict(eraw, project=other.name), now)
+    check("hooks: evidence matching isolates brand", not any(e["id"] == other_eid for e in ab.match_evidence(conn, q)))
+    try:
+        ab.link_evidence(conn, other_eid, "question", qid)
+        rejected = False
+    except ValueError:
+        rejected = True
+    check("hooks: direct cross-brand link rejected", rejected)
+    ab.link_evidence(conn, eid, "question", qid)
+    conn.execute("UPDATE questions SET state='ready',question=? WHERE id=?", (baitq["question"], qid))
+    check("hooks: no files or rows for all-blocked question", ab.generate_question_drafts(conn, cfg, [proj], now) == 0 and
+          conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0] == 0 and not os.path.exists(cfg["paths"]["drafts"]))
+    conn.close()
+
+
+def test_question_draft_packet(tmp_dir):
+    cfg, conn, proj, now, qraw, eraw = batch2_fixture(tmp_dir)
+    batch2_write(cfg, "questions", proj.name, [qraw])
+    batch2_write(cfg, "evidence", proj.name, [eraw])
+    report = ab.run_demand_pipeline(conn, cfg, [proj], now)
+    check("pipeline: imports and classifies offline", report["states"] == {"ready": 1}, str(report))
+    check("packet: creates one question draft", ab.generate_question_drafts(conn, cfg, [proj], now) == 1)
+    row = conn.execute("SELECT * FROM drafts WHERE question_id IS NOT NULL").fetchone()
+    with open(row["path"], encoding="utf-8") as fh:
+        packet = fh.read()
+    check("packet: header and required metadata", packet.startswith(ab.DRAFT_HEADER) and all(
+        k in packet for k in ("evidence_ids", "why_this_channel", "why_now", "검색량 미확인", "target_landing_url")))
+    check("packet: all hook comparisons", "## hooks (compare)" in packet and all(t in packet for t in ab.HOOK_TYPES))
+    check("packet: evidence dates and source", all(eraw[k] in packet for k in ("fact", "source_url", "verified_at", "valid_until")))
+    check("packet: deep URL and tracked hook", urllib.parse.urlsplit(row["landing_url"]).netloc == proj.host and
+          urllib.parse.urlsplit(row["landing_url"]).path != "/" and "utm_content=loss_prevention" in packet)
+    check("packet: reddit no site link", "soulbound.co.kr" not in code_block(packet, "reddit") and
+          "https://" not in code_block(packet, "reddit"))
+    check("packet: X limit and channel variety", len(code_block(packet, "x")) <= 280 and
+          len({code_block(packet, ch) for ch in cfg["channels"]}) == 4)
+    check("packet: database metadata and evidence links", row["page_url"].startswith("question:") and row["hook_type"] == "loss_prevention" and
+          row["why_this_channel"] and row["why_now"] and len(ab.linked_evidence(conn, "draft", row["id"])) == 1)
+    ab.run_demand_pipeline(conn, cfg, [proj], now)
+    check("pipeline: repeat creates no duplicate drafts/hooks", ab.generate_question_drafts(conn, cfg, [proj], now) == 0 and
+          conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0] == 1 and conn.execute("SELECT COUNT(*) FROM hooks").fetchone()[0] == 3)
+    # Question generation has its own per-project cap, applied after blocked items.
+    for i in range(3):
+        batch2_question(conn, cfg, proj, dict(qraw, question=f"Which sauna fixture {i}?"), now)
+    cfg["limits"]["max_question_drafts_per_run"] = 2
+    ab.run_demand_pipeline(conn, cfg, [proj], now)
+    check("packet: per-project run cap", ab.generate_question_drafts(conn, cfg, [proj], now) == 2)
+    status = ab.collect_status(conn, cfg, now)
+    check("status: demand counters exposed", status["projects"][proj.name]["questions"]["drafted"] == 3 and
+          status["projects"][proj.name]["evidence"]["active"] == 1 and
+          "demand: hanset" in ab.render_status_md(status, cfg, now, "test"))
+    conn.close()
+
+
+def test_config_batch2(tmp_dir):
+    cfg = make_cfg(tmp_dir)
+    check("config: five brand rule keys match projects", set(ab.BRAND_RULES) == {p.name for p in cfg["_projects"]})
+    check("config: every brand has demand clusters and tone", all(p.demand["clusters"] and p.demand["tone"] for p in cfg["_projects"]))
+    check("config: core bait terms", {"충격", "아무도 모르는", "무조건"} <= set(cfg["hooks"]["banned_terms"]))
+    with open(os.path.join(ROOT, "config.json"), encoding="utf-8") as fh:
+        legacy = json.load(fh)
+    for key in ("demand", "evidence", "questions", "hooks"):
+        legacy.pop(key, None)
+    for p in legacy["projects"]:
+        p.pop("demand", None)
+    path = os.path.join(tmp_dir, "legacy.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(legacy, fh)
+    old_cfg = ab.load_config(path)
+    check("config: legacy config fills Batch 2 defaults", old_cfg["demand"]["search_volume_default"] == "검색량 미확인" and
+          old_cfg["hooks"]["default"] == "loss_prevention" and all(p.demand["clusters"] for p in old_cfg["_projects"]))
+    legacy["projects"][0]["demand"] = {"tone": "custom brand tone"}
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(legacy, fh)
+    check("config: brand override retained", ab.load_config(path)["_projects"][0].demand["tone"] == "custom brand tone")
+    conn = ab.db_connect(cfg)
+    # Rebuild only old-format tables; the migration must retain their data.
+    conn.executescript("DROP TABLE drafts; CREATE TABLE drafts(id INTEGER PRIMARY KEY,project TEXT,page_url TEXT,"
+                       "path TEXT,channels TEXT,created TEXT,UNIQUE(project,page_url));"
+                       "INSERT INTO drafts VALUES(1,'hanset','old','old.md','x','old');")
+    conn.close()
+    conn = ab.db_connect(cfg)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(drafts)")}
+    check("config: legacy draft migration adds all fields", {"question_id", "landing_url", "hook_type", "evidence_ids",
+          "why_this_channel", "why_now"} <= cols and conn.execute("SELECT path FROM drafts WHERE id=1").fetchone()[0] == "old.md")
+    check("config: published migration fields", {"question_id", "hook_type"} <=
+          {r["name"] for r in conn.execute("PRAGMA table_info(published)")})
+    check("cli: no-demand flag", ab.build_parser().parse_args(["run", "--no-demand"]).no_demand)
+    conn.close()
+
+
+def test_batch2_cli_lifecycle(tmp_dir):
+    from contextlib import redirect_stdout
+    from io import StringIO
+    from unittest.mock import patch
+
+    cfg, conn, proj, now, qraw, eraw = batch2_fixture(tmp_dir)
+    batch2_write(cfg, "questions", proj.name, [qraw])
+    batch2_write(cfg, "evidence", proj.name, [eraw])
+    path = os.path.join(tmp_dir, "cli.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({k: v for k, v in cfg.items() if not k.startswith("_")}, fh, ensure_ascii=False)
+    conn.commit()
+    conn.close()
+    args = ["--config", path, "run", "--project", proj.name, "--no-crawl", "--no-discover", "--no-metrics"]
+    with patch.object(ab, "now_kst", return_value=now), patch.object(ab, "setup_logging"), redirect_stdout(StringIO()):
+        check("cli: local run can skip demand", ab.main(args + ["--no-demand"]) == 0)
+        conn = ab.db_connect(cfg)
+        check("cli: no-demand skips imports and question drafts", conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0] == 0 and
+              conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0] == 0)
+        conn.close()
+        check("cli: local demand run succeeds", ab.main(args) == 0)
+    conn = ab.db_connect(cfg)
+    draft = conn.execute("SELECT * FROM drafts").fetchone()
+    check("cli: demand pipeline runs before question draft generation", draft is not None and draft["question_id"] is not None)
+    eid = conn.execute("SELECT id FROM evidence").fetchone()[0]
+    post_id = ab.record_post(conn, proj.name, "threads", qraw["target_landing_url"], "cli fixture", now, evidence_ids=[eid])
+    conn.close()
+    late = now + timedelta(days=11)
+    with patch.object(ab, "now_kst", return_value=late), patch.object(ab, "setup_logging"), redirect_stdout(StringIO()):
+        check("cli: status applies local expiry", ab.main(["--config", path, "status"]) == 0)
+    conn = ab.db_connect(cfg)
+    check("cli: status held both question draft and reservation", conn.execute("SELECT state FROM drafts WHERE id=?", (draft["id"],)).fetchone()[0] == "expired_hold" and
+          conn.execute("SELECT state FROM published WHERE post_id=?", (post_id,)).fetchone()[0] == "expired_hold")
+    # A renewed human input reopens the question draft, preserving its identity and requiring review again.
+    batch2_write(cfg, "evidence", proj.name, [dict(eraw, verified_at=ab.iso(late), valid_until=ab.iso(late + timedelta(days=10)))])
+    ab.run_demand_pipeline(conn, cfg, [proj], late)
+    check("lifecycle: renewed evidence restores a ready question", conn.execute("SELECT state FROM questions").fetchone()[0] == "ready")
+    check("lifecycle: refreshed draft reuses the existing row", ab.generate_question_drafts(conn, cfg, [proj], late) == 1 and
+          conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0] == 1 and
+          conn.execute("SELECT state FROM drafts WHERE id=?", (draft["id"],)).fetchone()[0] == "candidate")
+    check("lifecycle: refreshed evidence does not resume a held reservation", conn.execute(
+        "SELECT state FROM published WHERE post_id=?", (post_id,)).fetchone()[0] == "expired_hold")
+    # Expiring one item still stops drafts that used it, even if the question has another active answer.
+    qid = draft["question_id"]
+    second = batch2_evidence(conn, proj, dict(eraw, id="second-answer", valid_until=ab.iso(late + timedelta(days=30))), late)
+    ab.link_evidence(conn, second, "question", qid)
+    result = ab.expire_evidence(conn, late + timedelta(days=11))
+    check("lifecycle: remaining evidence preserves question while old draft is held", result["held"] == 1 and result["questions_reopened"] == 0 and
+          conn.execute("SELECT state FROM questions WHERE id=?", (qid,)).fetchone()[0] == "drafted")
+    conn.close()
+
+
 def main():
     import tempfile
     print("offline tests for autobot.py")
@@ -1041,6 +1476,14 @@ def main():
     urllib.request.urlopen = local_urlopen
     server = start_server()
     try:
+        test_question_candidates(tempfile.mkdtemp(prefix="ab-questions-"))
+        test_evidence_validation(tempfile.mkdtemp(prefix="ab-evidence-"))
+        test_evidence_expiry(tempfile.mkdtemp(prefix="ab-expiry-"))
+        test_needs_research_and_no_demand(tempfile.mkdtemp(prefix="ab-research-"))
+        test_hooks(tempfile.mkdtemp(prefix="ab-hooks-"))
+        test_question_draft_packet(tempfile.mkdtemp(prefix="ab-packet-"))
+        test_config_batch2(tempfile.mkdtemp(prefix="ab-batch2-config-"))
+        test_batch2_cli_lifecycle(tempfile.mkdtemp(prefix="ab-batch2-cli-"))
         test_utm()
         test_urls()
         test_dates()

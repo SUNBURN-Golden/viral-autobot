@@ -32,7 +32,8 @@
     "max_metric_checks_per_run": 40,
     "metric_max_attempts": 3,
     "metric_retry_minutes": 60,
-    "max_reverify_per_site": 10
+    "max_reverify_per_site": 10,
+    "max_question_drafts_per_run": 5
   },
   "projects": [
     {
@@ -80,6 +81,48 @@
           "찜질방",
           "문신"
         ]
+      },
+      "demand": {
+        "languages": [
+          "en",
+          "ko"
+        ],
+        "tone": "외국인 영어 / 국내 한국어 분리; practical visit conditions",
+        "forbidden_terms": [
+          "방문 후기",
+          "직접 가봤"
+        ],
+        "natural_channel": "reddit",
+        "clusters": [
+          {
+            "key": "sauna-day-pass",
+            "terms": [
+              "sauna",
+              "day pass",
+              "jjimjilbang",
+              "사우나",
+              "예약 없이",
+              "준비물"
+            ],
+            "persona_decision": "A visitor decides whether a sauna permits a day visit without a reservation",
+            "natural_channel": "reddit",
+            "landing_hint": "sauna"
+          },
+          {
+            "key": "crossfit-drop-in",
+            "terms": [
+              "crossfit",
+              "drop-in",
+              "drop in",
+              "hyrox",
+              "크로스핏",
+              "드랍인"
+            ],
+            "persona_decision": "A visiting athlete checks drop-in eligibility and booking conditions",
+            "natural_channel": "reddit",
+            "landing_hint": "drop"
+          }
+        ]
       }
     },
     {
@@ -125,6 +168,35 @@
           "웹 소설",
           "한국 문학"
         ]
+      },
+      "demand": {
+        "languages": [
+          "ko"
+        ],
+        "tone": "ko 논쟁형 질문; 장면 근거와 반대 해석",
+        "forbidden_terms": [
+          "수준 낮은",
+          "작가 비방"
+        ],
+        "natural_channel": "threads",
+        "clusters": [
+          {
+            "key": "ending-interpretation",
+            "terms": [
+              "결말",
+              "해석",
+              "화자",
+              "webtoon",
+              "web novel",
+              "literature",
+              "비평",
+              "독서모임"
+            ],
+            "persona_decision": "독자가 장면 근거를 비교하며 인물의 선택과 결말을 해석",
+            "natural_channel": "threads",
+            "landing_hint": "review"
+          }
+        ]
       }
     },
     {
@@ -166,6 +238,37 @@
           "파인다이닝",
           "파인 다이닝",
           "레스토랑"
+        ]
+      },
+      "demand": {
+        "languages": [
+          "ko",
+          "en"
+        ],
+        "tone": "출처에 근거한 경력; employment and mentorship distinguished",
+        "forbidden_terms": [
+          "제자",
+          "수제자",
+          "protégé"
+        ],
+        "natural_channel": "instagram",
+        "clusters": [
+          {
+            "key": "chef-career",
+            "terms": [
+              "chef",
+              "셰프",
+              "경력",
+              "출신",
+              "restaurant",
+              "레스토랑",
+              "fine dining",
+              "파인다이닝"
+            ],
+            "persona_decision": "독자가 셰프의 확인된 경력과 현재 식당의 연결을 탐색",
+            "natural_channel": "instagram",
+            "landing_hint": "chef"
+          }
         ]
       }
     },
@@ -221,6 +324,37 @@
           "도서",
           "책"
         ]
+      },
+      "demand": {
+        "languages": [
+          "en",
+          "ko"
+        ],
+        "tone": "English first; practical submission conditions, Korean separately",
+        "forbidden_terms": [
+          "투고 완료",
+          "합격 보장",
+          "guaranteed acceptance"
+        ],
+        "natural_channel": "reddit",
+        "clusters": [
+          {
+            "key": "paid-submissions",
+            "terms": [
+              "paid submissions",
+              "submission fee",
+              "simultaneous submissions",
+              "open call",
+              "submissions",
+              "deadline",
+              "투고",
+              "마감"
+            ],
+            "persona_decision": "A writer decides where to submit based on eligibility, fees and deadlines",
+            "natural_channel": "reddit",
+            "landing_hint": "call"
+          }
+        ]
       }
     },
     {
@@ -258,6 +392,39 @@
           "유모차",
           "아기",
           "육아"
+        ]
+      },
+      "demand": {
+        "languages": [
+          "ko"
+        ],
+        "tone": "ko 해요체; 같은 모델·옵션의 조건을 비교해요",
+        "forbidden_terms": [
+          "최저가",
+          "가장 안전",
+          "무료배송 보장"
+        ],
+        "natural_channel": "threads",
+        "clusters": [
+          {
+            "key": "stroller-comparison",
+            "terms": [
+              "stroller",
+              "baby gear",
+              "유모차",
+              "유아용품",
+              "공구",
+              "배송비",
+              "공식 가격",
+              "구성",
+              "호환",
+              "교환",
+              "반품"
+            ],
+            "persona_decision": "부모가 같은 모델의 가격·구성·배송·반품 조건을 비교해 구매를 결정",
+            "natural_channel": "threads",
+            "landing_hint": "compar"
+          }
         ]
       }
     }
@@ -478,5 +645,73 @@
         }
       ]
     }
+  },
+  "demand": {
+    "search_volume_default": "검색량 미확인",
+    "lookback_days": 14,
+    "min_demand_score": 1,
+    "hold_pages_without_demand": true,
+    "priority_weights": {
+      "demand": 0.3,
+      "intent": 0.25,
+      "brand_fit": 0.15,
+      "evidence": 0.2,
+      "timeliness": 0.1
+    },
+    "intent_terms": [
+      "how",
+      "where",
+      "which",
+      "vs",
+      "price",
+      "fee",
+      "deadline",
+      "day pass",
+      "without reservation",
+      "가격",
+      "공구",
+      "배송비",
+      "호환",
+      "교환",
+      "반품",
+      "마감",
+      "투고료",
+      "준비물",
+      "당일",
+      "예약 없이",
+      "결말",
+      "해석"
+    ]
+  },
+  "evidence": {
+    "dir": "data/evidence",
+    "expiry_warn_days": 7
+  },
+  "questions": {
+    "dir": "data/questions"
+  },
+  "hooks": {
+    "types": [
+      "loss_prevention",
+      "unexpected_diff",
+      "discovery"
+    ],
+    "default": "loss_prevention",
+    "banned_terms": [
+      "충격",
+      "경악",
+      "아무도 모르는",
+      "무조건",
+      "100%",
+      "역대급",
+      "실화냐",
+      "미쳤다",
+      "꼭 봐야",
+      "shocking",
+      "nobody knows",
+      "you won't believe",
+      "guaranteed",
+      "must-see"
+    ]
   }
 }

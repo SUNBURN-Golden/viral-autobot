@@ -25,6 +25,8 @@ of a single project's failure.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from copy import deepcopy
 import gzip
 import hashlib
 import json
@@ -119,9 +121,72 @@ def fmt_kst(dt) -> str:
 # config
 # --------------------------------------------------------------------------
 
+SEARCH_VOLUME_UNKNOWN = "검색량 미확인"
+PERSONAL_KEYS = {"author", "username", "user", "author_fullname", "name", "email", "handle"}
+HOOK_TYPES = ("loss_prevention", "unexpected_diff", "discovery")
+BAIT_TERMS = ("충격", "경악", "아무도 모르는", "무조건", "100%", "역대급", "실화냐",
+              "미쳤다", "꼭 봐야", "shocking", "nobody knows", "you won't believe",
+              "guaranteed", "must-see")
+DEMAND_DEFAULTS = {
+    "search_volume_default": SEARCH_VOLUME_UNKNOWN, "lookback_days": 14,
+    "min_demand_score": 1, "hold_pages_without_demand": True,
+    "priority_weights": {"demand": .3, "intent": .25, "brand_fit": .15,
+                         "evidence": .2, "timeliness": .1},
+    "intent_terms": ["how", "where", "which", "vs", "price", "fee", "deadline", "day pass",
+                     "without reservation", "가격", "공구", "배송비", "호환", "교환", "반품",
+                     "마감", "투고료", "준비물", "당일", "예약 없이", "결말", "해석"],
+}
+
+
+def _brand(languages, tone, forbidden, channel, clusters):
+    return {"languages": languages, "tone": tone, "forbidden_terms": forbidden,
+            "natural_channel": channel, "clusters": [
+                {"key": key, "terms": terms, "persona_decision": persona,
+                 "natural_channel": channel, "landing_hint": hint}
+                for key, terms, persona, hint in clusters]}
+
+
+BRAND_RULES = {
+    "agamajung": _brand(["ko"], "ko 해요체; 같은 모델·옵션의 조건을 비교해요",
+        ["최저가", "가장 안전", "무료배송 보장"], "threads", [
+            ("stroller-comparison", ["stroller", "baby gear", "유모차", "유아용품", "공구", "배송비",
+                                    "공식 가격", "구성", "호환", "교환", "반품"],
+             "부모가 같은 모델의 가격·구성·배송·반품 조건을 비교해 구매를 결정", "compar")]),
+    "pitchboard": _brand(["en", "ko"], "English first; practical submission conditions, Korean separately",
+        ["투고 완료", "합격 보장", "guaranteed acceptance"], "reddit", [
+            ("paid-submissions", ["paid submissions", "submission fee", "simultaneous submissions",
+                                  "open call", "submissions", "deadline", "투고", "마감"],
+             "A writer decides where to submit based on eligibility, fees and deadlines", "call")]),
+    "goallit": _brand(["ko"], "ko 논쟁형 질문; 장면 근거와 반대 해석",
+        ["수준 낮은", "작가 비방"], "threads", [
+            ("ending-interpretation", ["결말", "해석", "화자", "webtoon", "web novel", "literature", "비평", "독서모임"],
+             "독자가 장면 근거를 비교하며 인물의 선택과 결말을 해석", "review")]),
+    "kitchengenome": _brand(["ko", "en"], "출처에 근거한 경력; employment and mentorship distinguished",
+        ["제자", "수제자", "protégé"], "instagram", [
+            ("chef-career", ["chef", "셰프", "경력", "출신", "restaurant", "레스토랑", "fine dining", "파인다이닝"],
+             "독자가 셰프의 확인된 경력과 현재 식당의 연결을 탐색", "chef")]),
+    "hanset": _brand(["en", "ko"], "외국인 영어 / 국내 한국어 분리; practical visit conditions",
+        ["방문 후기", "직접 가봤"], "reddit", [
+            ("sauna-day-pass", ["sauna", "day pass", "jjimjilbang", "사우나", "예약 없이", "준비물"],
+             "A visitor decides whether a sauna permits a day visit without a reservation", "sauna"),
+            ("crossfit-drop-in", ["crossfit", "drop-in", "drop in", "hyrox", "크로스핏", "드랍인"],
+             "A visiting athlete checks drop-in eligibility and booking conditions", "drop")]),
+}
+
+
+def _set_defaults(target, defaults):
+    for key, value in defaults.items():
+        if isinstance(value, dict):
+            _set_defaults(target.setdefault(key, {}), value)
+        else:
+            target.setdefault(key, deepcopy(value))
+
+
 class Project:
     def __init__(self, raw: dict):
         self.raw = raw
+        self.demand = deepcopy(raw.get("demand") or {})
+        _set_defaults(self.demand, BRAND_RULES.get(raw.get("name"), {}))
         self.name = str(raw.get("name") or "").strip()
         self.url = (raw.get("url") or None) if raw.get("url") not in ("", "null", None) else None
         self.keywords = [str(k).strip() for k in (raw.get("keywords") or []) if str(k).strip()]
@@ -170,6 +235,14 @@ def load_config(path: str) -> dict:
     paths.setdefault("status_slack", "out/status_slack.txt")
     paths.setdefault("rounds_log", "/workspace/viral/w1/rounds.log")
     paths.setdefault("status_md", "/workspace/viral/w1/status.md")
+    _set_defaults(cfg, {"demand": DEMAND_DEFAULTS,
+                        "evidence": {"dir": "data/evidence", "expiry_warn_days": 7},
+                        "questions": {"dir": "data/questions"},
+                        "hooks": {"types": list(HOOK_TYPES), "default": "loss_prevention",
+                                  "banned_terms": list(BAIT_TERMS)}})
+    limits.setdefault("max_question_drafts_per_run", 5)
+    for raw in cfg.get("projects") or []:
+        _set_defaults(raw.setdefault("demand", {}), BRAND_RULES.get(raw.get("name"), {}))
     cfg["_projects"] = [Project(p) for p in (cfg.get("projects") or [])]
     names = [p.name for p in cfg["_projects"]]
     if len(names) != len(set(names)):
@@ -321,6 +394,50 @@ CREATE TABLE IF NOT EXISTS post_events (
   at TEXT NOT NULL,
   reason TEXT
 );
+CREATE TABLE IF NOT EXISTS questions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project TEXT NOT NULL, question_key TEXT NOT NULL, question TEXT NOT NULL,
+  keyword_cluster TEXT, language TEXT NOT NULL DEFAULT 'en', source TEXT NOT NULL,
+  source_refs TEXT NOT NULL DEFAULT '[]', persona_decision TEXT NOT NULL,
+  why_now TEXT NOT NULL, unique_evidence TEXT, natural_channel TEXT NOT NULL,
+  target_landing_url TEXT,
+  search_volume_status TEXT NOT NULL DEFAULT '검색량 미확인', search_volume_source TEXT,
+  score_demand INTEGER NOT NULL DEFAULT 0, score_intent INTEGER NOT NULL DEFAULT 0,
+  score_brand_fit INTEGER NOT NULL DEFAULT 0, score_evidence INTEGER NOT NULL DEFAULT 0,
+  score_timeliness INTEGER NOT NULL DEFAULT 0, priority REAL NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'new'
+    CHECK (state IN ('new','ready','needs_research','no_demand_hold','drafted')),
+  hold_reason TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+  UNIQUE (project, question_key)
+);
+CREATE INDEX IF NOT EXISTS idx_q_proj_state ON questions(project, state, priority);
+CREATE TABLE IF NOT EXISTS evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project TEXT NOT NULL, evidence_key TEXT NOT NULL, keyword_cluster TEXT,
+  keywords TEXT NOT NULL DEFAULT '[]', kind TEXT, fact TEXT NOT NULL,
+  source_url TEXT NOT NULL, verified_at TEXT NOT NULL, valid_until TEXT NOT NULL,
+  allowed_claims TEXT NOT NULL, forbidden_claims TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active','expired','no_demand_hold')),
+  hold_reason TEXT, imported_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE (project, evidence_key)
+);
+CREATE TABLE IF NOT EXISTS evidence_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  evidence_id INTEGER NOT NULL REFERENCES evidence(id),
+  entity TEXT NOT NULL CHECK (entity IN ('question','draft','post')),
+  entity_id INTEGER NOT NULL,
+  UNIQUE (evidence_id, entity, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_entity ON evidence_links(entity, entity_id);
+CREATE TABLE IF NOT EXISTS hooks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,
+  question_id INTEGER NOT NULL REFERENCES questions(id),
+  hook_type TEXT NOT NULL CHECK (hook_type IN ('loss_prevention','unexpected_diff','discovery')),
+  language TEXT NOT NULL, text TEXT NOT NULL, evidence_ids TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL CHECK (status IN ('ok','blocked')), blocked_terms TEXT,
+  created TEXT NOT NULL, UNIQUE (question_id, hook_type)
+);
 CREATE TABLE IF NOT EXISTS blockers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project TEXT NOT NULL,
@@ -352,10 +469,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """Upgrade existing ledgers in place; safe to repeat on every connection."""
     additions = {
         "pages": {"http_status": "INTEGER", "last_verified": "TEXT", "valid_until": "TEXT"},
-        "drafts": {"state": "TEXT NOT NULL DEFAULT 'candidate'", "hold_reason": "TEXT"},
+        "drafts": {"state": "TEXT NOT NULL DEFAULT 'candidate'", "hold_reason": "TEXT",
+                   "question_id": "INTEGER", "landing_url": "TEXT", "hook_type": "TEXT",
+                   "evidence_ids": "TEXT", "why_this_channel": "TEXT", "why_now": "TEXT"},
         "published": {"post_id": "TEXT", "channel": "TEXT", "target_url": "TEXT",
                       "state": "TEXT NOT NULL DEFAULT 'published_verified'",
-                      "verified_at": "TEXT", "hold_reason": "TEXT"},
+                      "verified_at": "TEXT", "hold_reason": "TEXT",
+                      "question_id": "INTEGER", "hook_type": "TEXT"},
         "metric_checks": {"retry_at": "TEXT", "failure_reason": "TEXT"},
     }
     with conn:
@@ -462,7 +582,8 @@ def make_post_id(project, channel, url=None, label=None) -> str:
     return "p_" + hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
 
 
-def record_post(conn, project, channel, target_url, label, now, state="scheduled") -> str:
+def record_post(conn, project, channel, target_url, label, now, state="scheduled",
+                evidence_ids=()) -> str:
     """Record planned work, without asserting that anything has been published."""
     if state not in PRE_PUBLISH + HOLD_STATES:
         raise ValueError("record_post requires a pre-publication or hold state")
@@ -474,6 +595,12 @@ def record_post(conn, project, channel, target_url, label, now, state="scheduled
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ledger', ?)",
             (post_id, project, channel, channel, normalize_url(target_url) or None,
              label, state, iso(now), iso(now)))
+        row = conn.execute("SELECT id FROM published WHERE post_id=?", (post_id,)).fetchone()
+        for evidence_id in evidence_ids:
+            evidence = conn.execute("SELECT status,valid_until FROM evidence WHERE id=?", (evidence_id,)).fetchone()
+            if not evidence or evidence["status"] != "active" or _evidence_date(evidence["valid_until"]) < kst(now):
+                raise ValueError("post evidence must be active and unexpired")
+            link_evidence(conn, evidence_id, "post", row["id"])
     return post_id
 
 
@@ -787,13 +914,15 @@ def normalize_url(url: str, base: str = "") -> str:
     return f"{parts.scheme}://{host}{path}{query}"  # fragment dropped on purpose
 
 
-def add_utm(url: str, channel: str, campaign: str) -> str:
+def add_utm(url: str, channel: str, campaign: str, content=None) -> str:
     """Merge utm_* params into an existing query string without clobbering it."""
     if not url:
         return url
     parts = urllib.parse.urlsplit(url)
     params = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
     wanted = {"utm_source": channel, "utm_medium": "social", "utm_campaign": campaign}
+    if content is not None:
+        wanted["utm_content"] = content
     kept, seen = [], set()
     for key, value in params:
         if key in wanted:
@@ -1479,8 +1608,10 @@ def _store_reddit_candidates(conn, project, keyword, body, now_s) -> int:
 
 def _store_candidate(conn, project, keyword, source, url, title, subreddit,
                      created_utc, score, num_comments, now_s, stickied=False) -> bool:
-    url = normalize_url(url)
+    url = _safe_http_url(url)
     if not url or stickied:
+        return False
+    if source == "reddit" and not re.match(r"^/r/[^/]+/comments/[^/]+(?:/|$)", urllib.parse.urlsplit(url).path):
         return False
     created = None
     if created_utc:
@@ -1500,8 +1631,8 @@ def _store_candidate(conn, project, keyword, source, url, title, subreddit,
           last_seen=excluded.last_seen,
           title=COALESCE(excluded.title, candidates.title)
         """,
-        (project, keyword, source, url, clean_ws(title)[:300] if title else None,
-         subreddit, created, _int_or_none(score), _int_or_none(num_comments),
+        (project, scrub_personal(keyword), source, url, scrub_personal(title)[:300] if title else None,
+         scrub_personal(subreddit), created, _int_or_none(score), _int_or_none(num_comments),
          now_s, now_s),
     )
     conn.commit()
@@ -1513,6 +1644,674 @@ def _int_or_none(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+# --------------------------------------------------------------------------
+# 2b. demand & evidence (local, human-verified inputs only)
+# --------------------------------------------------------------------------
+
+def scrub_personal(text) -> str:
+    text = str(text or "")
+    text = re.sub(r"[\w.+-]+@[\w.-]+\.[\w-]+", "", text)
+    text = re.sub(r"(?<!\w)(?:/?u/|@)[\w-]+", "", text, flags=re.I)
+    return clean_ws(text)
+
+
+def detect_language(text) -> str:
+    return "ko" if re.search(r"[가-힣]", str(text or "")) else "en"
+
+
+def _norm_terms(text) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(text or "")).casefold())
+
+
+def find_banned_terms(text, extra=()) -> list:
+    norm = _norm_terms(text)
+    return list(dict.fromkeys(term for term in (*BAIT_TERMS, *extra)
+                              if term and _norm_terms(term) in norm))
+
+
+def _json_list(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    return value if isinstance(value, list) else []
+
+
+def _safe_http_url(value):
+    if not isinstance(value, str):
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(value)
+        if parts.username or parts.password:
+            return ""
+        return normalize_url(value)
+    except ValueError:
+        return ""
+
+
+def _safe_refs(value):
+    # Persist only thread URLs and candidate ids, never arbitrary payload dicts.
+    refs = []
+    for ref in _json_list(value):
+        if type(ref) is int:
+            refs.append(ref)
+        elif isinstance(ref, str):
+            url = _safe_http_url(ref)
+            if url:
+                parts = urllib.parse.urlsplit(url)
+                if not re.search(r"/(?:u|user)/", parts.path, re.I) and not parts.username:
+                    path = scrub_personal(urllib.parse.unquote(parts.path))
+                    refs.append(urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", "")))
+    return list(dict.fromkeys(refs))
+
+
+def is_deep_landing(url, proj, projects) -> tuple:
+    if not isinstance(url, str):
+        return False, "invalid_url"
+    try:
+        parts = urllib.parse.urlsplit(url or "")
+        host = parts.netloc.lower()
+        if parts.scheme not in ("http", "https") or not host or parts.username or parts.password:
+            return False, "invalid_url"
+        if any(p.name != proj.name and host in set(p.domains + [p.host]) for p in projects):
+            return False, "other_brand"
+        if host not in set(proj.domains + [proj.host]):
+            return False, "external_domain"
+        path = urllib.parse.unquote(parts.path).casefold()
+        path = os.path.normpath("/" + path.lstrip("/"))
+        if path in ("/", "/index.html"):
+            return False, "main_page"
+        return True, ""
+    except (ValueError, TypeError):
+        return False, "invalid_url"
+
+
+def resolve_landing(conn, proj, cluster, projects=None):
+    hint = (cluster or {}).get("landing_hint")
+    if not hint:
+        return None
+    for row in conn.execute("SELECT url FROM pages WHERE project=? "
+                            "AND last_status NOT IN ('gone','expired') ORDER BY last_seen DESC, id DESC",
+                            (proj.name,)):
+        if _norm_terms(hint) in _norm_terms(urllib.parse.unquote(row["url"])) and \
+                is_deep_landing(row["url"], proj, projects or [proj])[0]:
+            return row["url"]
+    return None
+
+
+def match_cluster(proj, text):
+    norm = _norm_terms(text)
+    matches = [(sum(_norm_terms(t) in norm for t in c.get("terms", []) if t), c)
+               for c in proj.demand.get("clusters", [])]
+    return max(matches, key=lambda pair: pair[0])[1] if any(n for n, _ in matches) else None
+
+
+def normalize_question(raw, proj, projects, cfg) -> tuple:
+    errors = []
+    if not isinstance(raw, dict):
+        return {}, ["invalid:question"]
+    rec = {key: scrub_personal(raw.get(key)) for key in
+           ("question", "persona_decision", "why_now", "unique_evidence", "natural_channel",
+            "keyword_cluster", "search_volume_source")}
+    for key in ("question", "persona_decision", "why_now", "unique_evidence",
+                "natural_channel", "target_landing_url"):
+        if not raw.get(key) or (key in rec and not rec[key]):
+            errors.append(f"missing:{key}")
+    rec["project"] = proj.name
+    if raw.get("project", proj.name) != proj.name:
+        errors.append("project:mismatch")
+    rec["source"] = raw.get("source", "manual")
+    if rec["source"] not in ("reddit", "rss", "search_console", "official", "manual"):
+        errors.append("invalid:source")
+    if rec["natural_channel"] not in ("reddit", "threads", "instagram", "x", "search_page"):
+        errors.append("invalid:natural_channel")
+    rec["language"] = detect_language(rec["question"])
+    rec["target_landing_url"] = _safe_http_url(raw.get("target_landing_url")) or None
+    if raw.get("target_landing_url"):
+        ok, reason = is_deep_landing(raw["target_landing_url"], proj, projects)
+        if not ok:
+            errors.append(f"landing:{reason}")
+    rec["search_volume_status"] = (scrub_personal(raw.get("search_volume_status"))
+                                   if rec["search_volume_source"] else SEARCH_VOLUME_UNKNOWN)
+    rec["search_volume_status"] = rec["search_volume_status"] or SEARCH_VOLUME_UNKNOWN
+    rec["source_refs"] = _safe_refs(raw.get("source_refs", []))
+    rec["question_key"] = hashlib.sha1(
+        f"{proj.name}|{rec['keyword_cluster']}|{_norm_terms(rec['question'])}".encode()).hexdigest()[:16]
+    return rec, errors
+
+
+def score_question(rec, proj, cfg, evidence_count, thread_stats, now) -> dict:
+    rec = dict(rec)
+    count = max(0, int(thread_stats.get("count", 0)))
+    demand = 3 if rec.get("source") == "search_console" else (0 if not count else 1 if count == 1 else 2 if count < 4 else 3)
+    volume = str(rec.get("search_volume_status") or "")
+    if rec.get("search_volume_source") and re.fullmatch(r"\d+", volume) and int(volume) > 0:
+        demand = max(1, demand)
+    text = _norm_terms(rec.get("question"))
+    cluster = next((c for c in proj.demand.get("clusters", [])
+                    if c["key"] == rec.get("keyword_cluster")), {})
+    latest = parse_iso(thread_stats.get("latest"))
+    expiry = parse_iso(thread_stats.get("valid_until"))
+    timely = bool(latest and now - timedelta(days=7) <= kst(latest) <= now or
+                  expiry and now <= kst(expiry) <= now + timedelta(days=14))
+    scores = {
+        "demand": demand,
+        "intent": min(3, sum(_norm_terms(t) in text for t in cfg["demand"]["intent_terms"] if t)),
+        "brand_fit": min(3, sum(_norm_terms(t) in text for t in
+                                set(cluster.get("terms", []) + proj.terms) if t)),
+        "evidence": min(3, max(0, evidence_count)), "timeliness": 3 if timely else 0,
+    }
+    weights = cfg["demand"]["priority_weights"]
+    # Normalize configurable weights so priority stays within 0..3.
+    total = sum(max(0, float(weights.get(k, 0))) for k in scores)
+    rec.update({"score_" + key: value for key, value in scores.items()})
+    rec["priority"] = round(sum(value * max(0, float(weights.get(key, 0)))
+                                for key, value in scores.items()) / (total or 1), 6)
+    return rec
+
+
+def upsert_question(conn, rec, now) -> int:
+    fields = ("project", "question_key", "question", "keyword_cluster", "language", "source",
+              "persona_decision", "why_now", "unique_evidence", "natural_channel",
+              "target_landing_url", "search_volume_status", "search_volume_source")
+    values = {k: rec.get(k) for k in fields}
+    old = conn.execute("SELECT * FROM questions WHERE project=? AND question_key=?",
+                       (rec["project"], rec["question_key"])).fetchone()
+    refs = _safe_refs(rec.get("source_refs", []))
+    if old:
+        refs = list(dict.fromkeys(_safe_refs(old["source_refs"]) + refs))
+    values.update(source_refs=json.dumps(refs, ensure_ascii=False), last_seen=iso(now))
+    updates = ", ".join(f"{k}=excluded.{k}" for k in values if k not in ("project", "question_key"))
+    values["first_seen"] = iso(now)
+    conn.execute(f"INSERT INTO questions ({','.join(values)}) VALUES ({','.join('?' for _ in values)}) "
+                 f"ON CONFLICT(project,question_key) DO UPDATE SET {updates}", tuple(values.values()))
+    return conn.execute("SELECT id FROM questions WHERE project=? AND question_key=?",
+                        (rec["project"], rec["question_key"])).fetchone()["id"]
+
+
+def _recent_candidates(conn, project, cfg, now):
+    cutoff = now - timedelta(days=cfg["demand"]["lookback_days"])
+    return [r for r in conn.execute("SELECT * FROM candidates WHERE project=? ORDER BY id", (project,))
+            if (dt := parse_iso(r["created_utc"] or r["first_seen"])) and cutoff <= kst(dt) <= now]
+
+
+def questions_from_candidates(conn, cfg, projects, now) -> dict:
+    result = {"created": 0, "skipped_unclustered": 0}
+    for proj in projects:
+        groups = {}
+        for row in _recent_candidates(conn, proj.name, cfg, now):
+            cluster = match_cluster(proj, (row["title"] or "") + " " + (row["keyword"] or ""))
+            if not cluster:
+                result["skipped_unclustered"] += 1
+                continue
+            groups.setdefault((cluster["key"], detect_language(row["title"])), (cluster, []))[1].append(row)
+        for (key, lang), (cluster, rows) in groups.items():
+            source = rows[0]["source"]
+            existing = conn.execute("SELECT * FROM questions WHERE project=? AND keyword_cluster=? "
+                                    "AND language=? AND source=? ORDER BY id LIMIT 1",
+                                    (proj.name, key, lang, source)).fetchone()
+            recent = [r for r in rows if kst(parse_iso(r["created_utc"] or r["first_seen"])) >= now - timedelta(days=7)]
+            n = len({r["url"] for r in recent})
+            why = f"최근 7일 공개 질문 {n}건 (수집 기간 {cfg['demand']['lookback_days']}일 {len(rows)}건)" if lang == "ko" else \
+                  f"{n} public questions in the last 7 days ({len(rows)} in {cfg['demand']['lookback_days']} days)"
+            raw = {"question": existing["question"] if existing else rows[0]["title"],
+                   "source": source, "source_refs": [v for r in rows for v in (r["id"], r["url"])],
+                   "keyword_cluster": key, "persona_decision": cluster["persona_decision"],
+                   "why_now": why, "unique_evidence": None,
+                   "natural_channel": cluster.get("natural_channel", proj.demand.get("natural_channel", "reddit")),
+                   "target_landing_url": resolve_landing(conn, proj, cluster, cfg["_projects"])}
+            rec, errors = normalize_question(raw, proj, cfg["_projects"], cfg)
+            # Discovery must retain unanswered questions for research, including absent landings.
+            errors = [e for e in errors if e not in ("missing:unique_evidence", "missing:target_landing_url")]
+            if errors:
+                log.warning("[questions:%s] candidate rejected: %s", proj.name, errors)
+                continue
+            upsert_question(conn, rec, now)
+            result["created"] += int(existing is None)
+    return result
+
+
+def _input_rows(cfg, section, proj):
+    directory = cfg[section]["dir"]
+    path = os.path.join(directory if os.path.isabs(directory) else os.path.join(BASE_DIR, directory),
+                        proj.name + ".json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if isinstance(payload, dict):
+            if payload.get("project", proj.name) != proj.name:
+                return [None]
+            payload = payload.get(section, [])
+        return payload if isinstance(payload, list) else [None]
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        log.warning("[%s:%s] invalid input file", section, proj.name)
+        return [None]
+
+
+def import_questions_dir(conn, cfg, projects, now):
+    result = {"imported": 0, "rejected": 0}
+    for proj in projects:
+        for raw in _input_rows(cfg, "questions", proj):
+            rec, errors = normalize_question(raw, proj, cfg["_projects"], cfg)
+            if not errors and rec.get("target_landing_url"):
+                page = conn.execute("SELECT last_status FROM pages WHERE project=? AND url=?",
+                                    (proj.name, rec["target_landing_url"])).fetchone()
+                if not page or page["last_status"] in ("gone", "expired"):
+                    errors.append("landing:not_live_crawled_page")
+            if errors:
+                result["rejected"] += 1
+                log.warning("[questions:%s] rejected: %s", proj.name, errors)
+            else:
+                upsert_question(conn, rec, now)
+                result["imported"] += 1
+    return result
+
+
+def _evidence_date(value):
+    try:
+        return kst(datetime.fromisoformat(value)) if isinstance(value, str) else None
+    except ValueError:
+        return None
+
+
+def validate_evidence(raw, proj, now=None) -> tuple:
+    if not isinstance(raw, dict):
+        return {}, ["invalid:evidence"]
+    now = kst(now or now_kst())
+    errors = []
+    for key in ("fact", "source_url", "verified_at", "valid_until", "allowed_claims", "forbidden_claims"):
+        if key not in raw or (key != "forbidden_claims" and not raw[key]):
+            errors.append(f"missing:{key}")
+    if raw.get("project", proj.name) != proj.name:
+        errors.append("project:mismatch")
+    url = _safe_http_url(raw.get("source_url"))
+    if not url:
+        errors.append("invalid:source_url")
+    verified, until = _evidence_date(raw.get("verified_at")), _evidence_date(raw.get("valid_until"))
+    if not verified or verified > now:
+        errors.append("invalid:verified_at")
+    if not until or verified and until <= verified:
+        errors.append("invalid:valid_until")
+    claims = {}
+    for key in ("allowed_claims", "forbidden_claims", "keywords"):
+        value = raw.get(key, [])
+        if not isinstance(value, list) or any(not isinstance(v, str) or not v.strip() for v in value):
+            errors.append(f"invalid:{key}")
+            value = []
+        claims[key] = [scrub_personal(v) for v in value]
+    if not claims["allowed_claims"] or not all(claims["allowed_claims"]):
+        errors.append("invalid:allowed_claims")
+    if set(map(_norm_terms, claims["allowed_claims"])) & set(map(_norm_terms, claims["forbidden_claims"])):
+        errors.append("conflict:claims")
+    for claim in claims["allowed_claims"]:
+        brand_terms = proj.demand.get("forbidden_terms", []) if proj.name != "kitchengenome" else []
+        if find_banned_terms(claim, brand_terms):
+            errors.append("banned:allowed_claims")
+    fact = scrub_personal(raw.get("fact"))
+    if not fact:
+        errors.append("missing:fact")
+    rec = {"project": proj.name, "fact": fact, "source_url": url,
+           "verified_at": iso(verified) if verified else "", "valid_until": iso(until) if until else "",
+           "keyword_cluster": scrub_personal(raw.get("keyword_cluster")) or None,
+           "kind": scrub_personal(raw.get("kind")) or None, **claims}
+    rec["evidence_key"] = scrub_personal(raw.get("id") or raw.get("evidence_key")) or hashlib.sha1(
+        f"{proj.name}|{url}|{fact}".encode()).hexdigest()[:16]
+    return rec, list(dict.fromkeys(errors))
+
+
+def upsert_evidence(conn, rec, now) -> int:
+    fields = ("project", "evidence_key", "keyword_cluster", "keywords", "kind", "fact", "source_url",
+              "verified_at", "valid_until", "allowed_claims", "forbidden_claims")
+    values = {k: json.dumps(rec[k], ensure_ascii=False) if k in ("keywords", "allowed_claims", "forbidden_claims")
+              else rec.get(k) for k in fields}
+    old = conn.execute("SELECT * FROM evidence WHERE project=? AND evidence_key=?",
+                       (rec["project"], rec["evidence_key"])).fetchone()
+    # Keep newly expired records active until expire_evidence can audit all affected entities.
+    values["status"] = "active" if not old or _evidence_date(rec["valid_until"]) > now else old["status"]
+    values["hold_reason"] = None if values["status"] == "active" else (old["hold_reason"] if old else None)
+    values["updated_at"] = iso(now)
+    updates = ",".join(f"{k}=excluded.{k}" for k in values if k not in ("project", "evidence_key"))
+    values["imported_at"] = iso(now)
+    conn.execute(f"INSERT INTO evidence ({','.join(values)}) VALUES ({','.join('?' for _ in values)}) "
+                 f"ON CONFLICT(project,evidence_key) DO UPDATE SET {updates}", tuple(values.values()))
+    return conn.execute("SELECT id FROM evidence WHERE project=? AND evidence_key=?",
+                        (rec["project"], rec["evidence_key"])).fetchone()["id"]
+
+
+def import_evidence_dir(conn, cfg, projects, now) -> dict:
+    result = {"imported": 0, "rejected": 0}
+    for proj in projects:
+        for raw in _input_rows(cfg, "evidence", proj):
+            rec, errors = validate_evidence(raw, proj, now)
+            if errors:
+                result["rejected"] += 1
+                log.warning("[evidence:%s] rejected: %s", proj.name, errors)
+            else:
+                upsert_evidence(conn, rec, now)
+                result["imported"] += 1
+    return result
+
+
+def link_evidence(conn, evidence_id, entity, entity_id):
+    table = {"question": "questions", "draft": "drafts", "post": "published"}.get(entity)
+    if table is None:
+        raise ValueError("unknown evidence entity")
+    evidence = conn.execute("SELECT project FROM evidence WHERE id=?", (evidence_id,)).fetchone()
+    target = conn.execute(f"SELECT project FROM {table} WHERE id=?", (entity_id,)).fetchone()
+    if not evidence or not target or evidence["project"] != target["project"]:
+        raise ValueError("evidence link must belong to the same brand")
+    conn.execute("INSERT OR IGNORE INTO evidence_links (evidence_id,entity,entity_id) VALUES (?,?,?)",
+                 (evidence_id, entity, entity_id))
+
+
+def linked_evidence(conn, entity, entity_id, active_only=True):
+    return conn.execute("SELECT e.* FROM evidence e JOIN evidence_links l ON l.evidence_id=e.id "
+                        "WHERE l.entity=? AND l.entity_id=?" + (" AND e.status='active'" if active_only else "") +
+                        " ORDER BY e.id", (entity, entity_id)).fetchall()
+
+
+def match_evidence(conn, question_row):
+    q = dict(question_row)
+    text = _norm_terms(q["question"])
+    return [e for e in conn.execute("SELECT * FROM evidence WHERE project=? "
+                                   "AND status IN ('active','no_demand_hold') ORDER BY id", (q["project"],))
+            if (q.get("keyword_cluster") and e["keyword_cluster"] == q["keyword_cluster"]) or
+            any(_norm_terms(k) in text for k in _json_list(e["keywords"]) if k)]
+
+
+def _set_question_state(conn, qid, state, reason=None):
+    conn.execute("UPDATE questions SET state=?,hold_reason=? WHERE id=?", (state, reason, qid))
+
+
+def expire_evidence(conn, now) -> dict:
+    now = kst(now)
+    result = {"expired": 0, "held": 0, "questions_reopened": 0}
+    conn.execute("SAVEPOINT evidence_expiry")
+    try:
+        affected = set()
+        rows = conn.execute("SELECT * FROM evidence WHERE status!='expired'").fetchall()
+        for e in rows:
+            if _evidence_date(e["valid_until"]) >= now:
+                continue
+            conn.execute("UPDATE evidence SET status='expired',hold_reason='valid_until elapsed',updated_at=? "
+                         "WHERE id=?", (iso(now), e["id"]))
+            result["expired"] += 1
+            for link in conn.execute("SELECT * FROM evidence_links WHERE evidence_id=?", (e["id"],)).fetchall():
+                if link["entity"] == "question":
+                    affected.add(link["entity_id"])
+                    continue
+                table = "drafts" if link["entity"] == "draft" else "published"
+                row = conn.execute(f"SELECT state,question_id FROM {table} WHERE id=?", (link["entity_id"],)).fetchone()
+                if row and row["state"] in PRE_PUBLISH:
+                    transition(conn, link["entity"], link["entity_id"], "expired_hold", now,
+                               f"evidence expired: {e['evidence_key']}")
+                    result["held"] += 1
+                if row and row["question_id"]:
+                    affected.add(row["question_id"])
+        for qid in affected:
+            if not linked_evidence(conn, "question", qid):
+                q = conn.execute("SELECT state,hold_reason FROM questions WHERE id=?", (qid,)).fetchone()
+                if q and (q["state"] != "needs_research" or q["hold_reason"] != "no_verified_evidence"):
+                    _set_question_state(conn, qid, "needs_research", "no_verified_evidence")
+                    conn.execute("UPDATE questions SET unique_evidence=NULL,score_evidence=0 WHERE id=?", (qid,))
+                    result["questions_reopened"] += 1
+        conn.execute("RELEASE evidence_expiry")
+    except Exception:
+        conn.execute("ROLLBACK TO evidence_expiry")
+        conn.execute("RELEASE evidence_expiry")
+        raise
+    return result
+
+
+def classify_questions(conn, cfg, projects, now):
+    counts = Counter()
+    for proj in projects:
+        for q in conn.execute("SELECT * FROM questions WHERE project=? AND state!='drafted'", (proj.name,)).fetchall():
+            evidences = [e for e in linked_evidence(conn, "question", q["id"])
+                         if _evidence_date(e["valid_until"]) >= now]
+            landing = q["target_landing_url"]
+            page = conn.execute("SELECT last_status FROM pages WHERE project=? AND url=?",
+                                (proj.name, landing)).fetchone() if landing else None
+            if not evidences:
+                state, reason = "needs_research", "no_verified_evidence"
+            elif not landing or not page or page["last_status"] in ("gone", "expired") or \
+                    not is_deep_landing(landing, proj, cfg["_projects"])[0]:
+                state, reason = "needs_research", "landing_missing"
+            elif q["score_demand"] < cfg["demand"]["min_demand_score"]:
+                state, reason = "no_demand_hold", "no_question_demand"
+            else:
+                state, reason = "ready", None
+            _set_question_state(conn, q["id"], state, reason)
+            counts[state] += 1
+    return counts
+
+
+def hold_evidence_without_demand(conn, now):
+    for e in conn.execute("SELECT * FROM evidence WHERE status!='expired'").fetchall():
+        demand = conn.execute("SELECT 1 FROM evidence_links l JOIN questions q ON q.id=l.entity_id "
+                              "WHERE l.evidence_id=? AND l.entity='question' AND q.score_demand>0 LIMIT 1",
+                              (e["id"],)).fetchone()
+        state, reason = ("active", None) if demand else ("no_demand_hold", "no_question_demand")
+        conn.execute("UPDATE evidence SET status=?,hold_reason=?,updated_at=? WHERE id=?",
+                     (state, reason, iso(now), e["id"]))
+
+
+HOOK_TEMPLATES = {
+    "loss_prevention": {"ko": "{topic} 결정 전에 확인해요: {claim}",
+                        "en": "Before deciding on {topic}, check: {claim}"},
+    "unexpected_diff": {"ko": "{topic}, 선택을 가르는 조건을 비교해요: {claim}",
+                        "en": "Compare the conditions for {topic}: {claim}"},
+    "discovery": {"ko": "{topic}에서 살펴볼 선택지가 있어요: {claim}",
+                  "en": "An option to explore for {topic}: {claim}"},
+}
+
+
+def generate_hooks(question_row, evidences, proj, cfg):
+    q = dict(question_row)
+    evidences = [e for e in evidences if e["project"] == proj.name and e["status"] == "active"]
+    claims = [claim for e in evidences for claim in _json_list(e["allowed_claims"])]
+    lang = q.get("language") or detect_language(q["question"])
+    brand_terms = list(proj.demand.get("forbidden_terms", []))
+    if proj.name == "kitchengenome":
+        brand_terms = [t for t in brand_terms if not any(_norm_terms(t) in _norm_terms(c) for c in claims)]
+    forbidden = [c for e in evidences for c in _json_list(e["forbidden_claims"])]
+    extra = [*cfg["hooks"]["banned_terms"], *brand_terms, *forbidden]
+    hooks = {}
+    for kind in HOOK_TYPES:
+        text = HOOK_TEMPLATES[kind][lang].format(topic=q["question"], claim=claims[0] if claims else "", cond="")
+        # goallit uses a scene-based debate, without evaluating the author or reader.
+        if proj.name == "goallit":
+            text += " 이 장면을 다르게 읽을 수 있을까요?" if lang == "ko" else " How else could this scene be read?"
+        terms = find_banned_terms(text, extra)
+        hooks[kind] = {"text": text, "status": "blocked" if terms or not claims else "ok",
+                       "blocked_terms": terms or ([] if claims else ["missing:allowed_claims"]),
+                       "evidence_ids": [e["id"] for e in evidences], "language": lang, "project": proj.name}
+    return hooks
+
+
+def store_hooks(conn, question_id, hooks, now):
+    q = conn.execute("SELECT project,language FROM questions WHERE id=?", (question_id,)).fetchone()
+    for kind, hook in hooks.items():
+        conn.execute("INSERT INTO hooks (project,question_id,hook_type,language,text,evidence_ids,status,blocked_terms,created) "
+                     "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(question_id,hook_type) DO UPDATE SET "
+                     "language=excluded.language,text=excluded.text,evidence_ids=excluded.evidence_ids,"
+                     "status=excluded.status,blocked_terms=excluded.blocked_terms,created=excluded.created",
+                     (q["project"], question_id, kind, q["language"], hook["text"],
+                      json.dumps(hook["evidence_ids"]), hook["status"],
+                      json.dumps(hook["blocked_terms"], ensure_ascii=False), iso(now)))
+
+
+def _question_thread_stats(conn, q, cfg, now):
+    refs = _safe_refs(q["source_refs"])
+    rows = [r for r in _recent_candidates(conn, q["project"], cfg, now)
+            if r["id"] in refs or r["url"] in refs]
+    return {"count": len({r["url"] for r in rows}),
+            "latest": iso(max(kst(parse_iso(r["created_utc"] or r["first_seen"])) for r in rows)) if rows else None}
+
+
+def run_demand_pipeline(conn, cfg, projects, now) -> dict:
+    now = kst(now)
+    result = {}
+    result["evidence"] = import_evidence_dir(conn, cfg, projects, now)
+    result["expiry"] = expire_evidence(conn, now)
+    result["candidates"] = questions_from_candidates(conn, cfg, projects, now)
+    result["questions"] = import_questions_dir(conn, cfg, projects, now)
+    for proj in projects:
+        for row in conn.execute("SELECT * FROM questions WHERE project=?", (proj.name,)).fetchall():
+            q = dict(row)
+            if not q["target_landing_url"]:
+                cluster = next((c for c in proj.demand.get("clusters", []) if c["key"] == q["keyword_cluster"]), None)
+                q["target_landing_url"] = resolve_landing(conn, proj, cluster, cfg["_projects"])
+                conn.execute("UPDATE questions SET target_landing_url=? WHERE id=?", (q["target_landing_url"], q["id"]))
+            evidences = [e for e in match_evidence(conn, q) if _evidence_date(e["valid_until"]) >= now]
+            # Question links describe the current match; draft/post links preserve their historical claims.
+            conn.execute("DELETE FROM evidence_links WHERE entity='question' AND entity_id=?", (q["id"],))
+            for e in evidences:
+                conn.execute("UPDATE evidence SET status='active',hold_reason=NULL WHERE id=?", (e["id"],))
+                link_evidence(conn, e["id"], "question", q["id"])
+            claims = [claim for e in evidences for claim in _json_list(e["allowed_claims"])]
+            conn.execute("UPDATE questions SET unique_evidence=? WHERE id=?",
+                         ("; ".join(claims) if claims else None, q["id"]))
+            stats = _question_thread_stats(conn, q, cfg, now)
+            stats["valid_until"] = iso(min(_evidence_date(e["valid_until"]) for e in evidences)) if evidences else None
+            scored = score_question(q, proj, cfg, len(evidences), stats, now)
+            keys = ["score_demand", "score_intent", "score_brand_fit", "score_evidence", "score_timeliness", "priority"]
+            conn.execute("UPDATE questions SET " + ",".join(k + "=?" for k in keys) + " WHERE id=?",
+                         tuple(scored[k] for k in keys) + (q["id"],))
+    result["states"] = dict(classify_questions(conn, cfg, projects, now))
+    for proj in projects:
+        for q in conn.execute("SELECT * FROM questions WHERE project=? AND state='ready'", (proj.name,)).fetchall():
+            store_hooks(conn, q["id"], generate_hooks(q, linked_evidence(conn, "question", q["id"]), proj, cfg), now)
+    hold_evidence_without_demand(conn, now)
+    conn.commit()
+    return result
+
+
+def _select_hook(hooks, cfg):
+    preferred = cfg["hooks"]["default"]
+    return next((k for k in (preferred, *HOOK_TYPES) if k in hooks and hooks[k]["status"] == "ok"), None)
+
+
+def _why_this_channel(q):
+    reasons = {
+        "reddit": ("기존 질문에 조건과 근거로 직접 답변", "Answer an existing question with conditions and evidence"),
+        "threads": ("근거 하나와 해석 질문으로 대화", "Discuss one supported point with a question"),
+        "instagram": ("비교표·경력 지도·체크리스트를 저장·공유", "Save and share a comparison, career map or checklist"),
+        "x": ("짧은 조건 요약과 심층 자료 안내", "Share a short condition summary with deeper evidence"),
+        "search_page": ("반복되는 질문에 답과 출처를 장기 보존", "Keep an answer and sources for a recurring search question"),
+    }
+    channel = q["natural_channel"]
+    reason = reasons[channel][0 if q["language"] == "ko" else 1]
+    return f"{channel} — {reason}"
+
+
+def render_question_packet(proj, q, evidences, hooks, cfg, now) -> str:
+    selected = _select_hook(hooks, cfg)
+    if selected is None:
+        raise ValueError("no permitted hook")
+    hook = hooks[selected]["text"]
+    lang = q["language"]
+    claim = _json_list(evidences[0]["allowed_claims"])[0]
+    links = {ch: add_utm(q["target_landing_url"], ch, cfg["campaign"], selected) for ch in cfg["channels"]}
+    lines = [DRAFT_HEADER, "", f"- project: {proj.name}", f"- generated: {fmt_kst(now)}",
+             f"- persona_decision: {q['persona_decision']}", f"- why_now: {q['why_now']}",
+             f"- why_this_channel: {_why_this_channel(q)}",
+             f"- tone: {proj.demand.get('tone', '')}",
+             f"- evidence_ids: {json.dumps([e['id'] for e in evidences])}",
+             f"- search_volume_status: {q['search_volume_status']}",
+             f"- target_landing_url: {q['target_landing_url']}", "", "## hooks (compare)", ""]
+    for kind in HOOK_TYPES:
+        item = hooks[kind]
+        lines.append(f"- {kind} [{item['status']}]: {item['text']} (blocked_terms: {item['blocked_terms']})")
+    # Reddit is a direct answer, never a link placement. Strip URLs even from verified claims.
+    answer = re.sub(r"(?:https?://\S+|(?:[\w-]+\.)+[a-zA-Z]{2,63}(?:/\S*)?)", "", claim)
+    for ch in cfg["channels"]:
+        link = links[ch]
+        if ch == "x":
+            text = (clip(hook, max(0, 279 - len(link))) + "\n" + link).strip()
+            text = text if len(text) <= 280 else clip(hook, 280)
+        elif ch == "threads":
+            text = f"{hook}\n\n" + ("어떤 조건이 선택에 가장 영향을 주나요?" if lang == "ko" else
+                                     "Which condition matters most to your decision?") + f"\n{link}"
+        elif ch == "instagram":
+            text = ("비교 체크리스트 — 저장해 두세요" if lang == "ko" else "Comparison checklist — save for planning")
+            text += f"\n\n{hook}\n• {claim}\n" + ("확인일: " if lang == "ko" else "Verified: ")
+            text += f"{evidences[0]['verified_at']}\n{link}"
+        else:
+            text = ("확인된 조건: " if lang == "ko" else "Verified condition: ") + answer
+            text += "\n" + ("조건과 유효기간을 확인한 뒤 결정하세요." if lang == "ko" else
+                             "Check the conditions and validity dates before deciding.")
+        lines += ["", f"## {ch}", "", "```text", text, "```"]
+    lines += ["", "## evidence", ""]
+    for e in evidences:
+        lines += [f"- [{e['id']}] fact: {e['fact']}", f"  source_url: {e['source_url']}",
+                  f"  verified_at: {e['verified_at']}", f"  valid_until: {e['valid_until']}",
+                  f"  allowed_claims: {e['allowed_claims']}", f"  forbidden_claims: {e['forbidden_claims']}"]
+    lines += ["", "compliance checklist before posting:",
+              "- [ ] Verify claims, source and expiry; use only allowed claims",
+              "- [ ] Review platform rules and disclose the brand relationship",
+              "- [ ] Check deep landing, brand, language and UTM",
+              "- [ ] No personal data, bait, unsupported claims or invented metrics",
+              "- [ ] Human review required; this tool has not posted or scheduled anything", ""]
+    return "\n".join(lines)
+
+
+def generate_question_drafts(conn, cfg, projects, now) -> int:
+    expire_evidence(conn, now)
+    made = 0
+    for proj in projects:
+        count = 0
+        for q in conn.execute("SELECT * FROM questions WHERE project=? AND state='ready' ORDER BY priority DESC,id",
+                              (proj.name,)).fetchall():
+            if count >= cfg["limits"].get("max_question_drafts_per_run", 5):
+                break
+            evidences = linked_evidence(conn, "question", q["id"])
+            if not evidences:
+                _set_question_state(conn, q["id"], "needs_research", "no_verified_evidence")
+                continue
+            page = conn.execute("SELECT last_status FROM pages WHERE project=? AND url=?",
+                                (proj.name, q["target_landing_url"])).fetchone()
+            if not page or page["last_status"] in ("gone", "expired") or \
+                    not is_deep_landing(q["target_landing_url"], proj, cfg["_projects"])[0]:
+                _set_question_state(conn, q["id"], "needs_research", "landing_missing")
+                continue
+            hooks = generate_hooks(q, evidences, proj, cfg)
+            store_hooks(conn, q["id"], hooks, now)
+            selected = _select_hook(hooks, cfg)
+            if selected is None:
+                continue
+            directory = os.path.join(abs_path(cfg, "drafts"), proj.name)
+            os.makedirs(directory, exist_ok=True)
+            filename = f"{kst(now):%Y%m%d}_q-{slugify(q['question'])}-{q['question_key']}.md"
+            path = os.path.join(directory, filename)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(render_question_packet(proj, q, evidences, hooks, cfg, now))
+            why = _why_this_channel(q)
+            ids = json.dumps([e["id"] for e in evidences])
+            conn.execute("INSERT INTO drafts (project,page_url,path,channels,created,question_id,landing_url,"
+                         "hook_type,evidence_ids,why_this_channel,why_now) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                         "ON CONFLICT(project,page_url) DO UPDATE SET path=excluded.path,channels=excluded.channels,"
+                         "created=excluded.created,landing_url=excluded.landing_url,hook_type=excluded.hook_type,"
+                         "evidence_ids=excluded.evidence_ids,why_this_channel=excluded.why_this_channel,why_now=excluded.why_now",
+                         (proj.name, "question:" + q["question_key"], path, ",".join(cfg["channels"]), iso(now),
+                          q["id"], q["target_landing_url"], selected, ids, why, q["why_now"]))
+            draft = conn.execute("SELECT id,state FROM drafts WHERE project=? AND page_url=?",
+                                 (proj.name, "question:" + q["question_key"])).fetchone()
+            if draft["state"] in HOLD_STATES:
+                transition(conn, "draft", draft["id"], "candidate", now, "verified evidence refreshed")
+            conn.execute("DELETE FROM evidence_links WHERE entity='draft' AND entity_id=?", (draft["id"],))
+            for e in evidences:
+                link_evidence(conn, e["id"], "draft", draft["id"])
+            _set_question_state(conn, q["id"], "drafted")
+            count += 1
+            made += 1
+    conn.commit()
+    return made
 
 
 # --------------------------------------------------------------------------
@@ -1568,6 +2367,14 @@ def generate_drafts(conn: sqlite3.Connection, cfg: dict, projects, now: datetime
                 """,
                 (proj.name, page["url"], path, ",".join(cfg.get("channels", [])),
                  page["last_status"], iso(now)))
+            if cfg.get("demand", {}).get("hold_pages_without_demand", True):
+                demand = conn.execute("SELECT 1 FROM questions WHERE project=? AND target_landing_url=? "
+                                      "AND score_demand>=? LIMIT 1",
+                                      (proj.name, page["url"], cfg["demand"]["min_demand_score"])).fetchone()
+                draft = conn.execute("SELECT id,state FROM drafts WHERE project=? AND page_url=?",
+                                     (proj.name, page["url"])).fetchone()
+                if not demand and draft["state"] in PRE_PUBLISH:
+                    transition(conn, "draft", draft["id"], "no_demand_hold", now, "no question demand for page")
             conn.commit()
             log.info("[draft:%s] wrote %s (%s)", proj.name, os.path.basename(path),
                      page["last_status"])
@@ -2107,6 +2914,10 @@ def collect_status(conn: sqlite3.Connection, cfg: dict, now: datetime) -> dict:
             "candidates": cand_total, "candidates_7d": cand_7d,
             "drafts": drafts_n, "published": pub_n,
             "metrics": _metrics_cell(conn, proj.name),
+            "questions": Counter({r["state"]: r["n"] for r in conn.execute(
+                "SELECT state,COUNT(*) AS n FROM questions WHERE project=? GROUP BY state", (proj.name,))}),
+            "evidence": Counter({r["status"]: r["n"] for r in conn.execute(
+                "SELECT status,COUNT(*) AS n FROM evidence WHERE project=? GROUP BY status", (proj.name,))}),
             "blockers": blockers,
             "blocker_codes": [b.split(":", 1)[0] for b in blockers],
         }
@@ -2175,6 +2986,10 @@ def render_status_md(status: dict, cfg: dict, now: datetime, mode: str) -> str:
             f"| {name} | {row['new_content']} | {cand} | {row['drafts']} | "
             f"{row['published']} | {row['metrics']} | "
             f"{'; '.join(row['blockers']) if row['blockers'] else '없음'} |")
+    lines.append("")
+    for name, row in status["projects"].items():
+        lines.append(f"- demand: {name} — questions {dict(row.get('questions', {}))}; "
+                     f"evidence {dict(row.get('evidence', {}))}")
     lines += [
         "",
         "## notes",
@@ -2333,11 +3148,20 @@ def cmd_run(args) -> int:
         except Exception as exc:
             log.exception("[discover] failed: %s", type(exc).__name__)
 
+    if not args.no_demand:
+        try:
+            report = run_demand_pipeline(conn, cfg, projects, now_kst())
+            log.info("[demand] %s", report)
+        except Exception as exc:
+            log.exception("[demand] failed: %s", type(exc).__name__)
+
     if args.no_drafts:
         log.info("drafts skipped (--no-drafts)")
     else:
         try:
             generate_drafts(conn, cfg, projects, now_kst(), run_started_iso)
+            if not args.no_demand:
+                generate_question_drafts(conn, cfg, projects, now_kst())
         except Exception as exc:
             log.exception("[draft] failed: %s", type(exc).__name__)
 
@@ -2370,6 +3194,8 @@ def cmd_status(args) -> int:
     fetcher = Fetcher(cfg)
     started = now_kst()
     log.info("status start %s (crawl/discover/draft not run)", fmt_kst(started))
+    expire_evidence(conn, now_kst())
+    conn.commit()
     process_rounds_log(conn, cfg, now_kst())
     run_due_checks(conn, fetcher, cfg, now_kst())
     write_status(conn, cfg, now_kst(), mode="status")
@@ -2407,6 +3233,7 @@ def build_parser() -> argparse.ArgumentParser:
                      help="post out/status_slack.txt to Slack if a webhook is configured")
     run.add_argument("--no-crawl", action="store_true", help="skip the crawl step")
     run.add_argument("--no-discover", action="store_true", help="skip discovery")
+    run.add_argument("--no-demand", action="store_true", help="skip local demand/evidence pipeline")
     run.add_argument("--no-drafts", action="store_true", help="skip draft generation")
     run.add_argument("--no-metrics", action="store_true", help="skip rounds.log metrics")
     run.add_argument("--max-urls", type=int, default=None,
