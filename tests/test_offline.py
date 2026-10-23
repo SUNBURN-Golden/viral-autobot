@@ -571,6 +571,118 @@ def test_robots_rules():
           std.can_fetch(ua, "https://x.test/private/hidden") is True, "")
 
 
+def test_daemon_stages_and_fallback(tmp_dir):
+    import daemon as dm
+    cfg_path = os.path.join(ROOT, "config.json")
+    dcfg = dm.load_daemon_config(cfg_path)
+    check("daemon: audit_every_prs == 10", dcfg.get("audit_every_prs") == 10, str(dcfg.get("audit_every_prs")))
+
+    expected = {
+        "design": [("opus55", "claude", "claude-opus-5-5", "medium"),
+                   ("astra6", "codex", "gpt-6-astra", "high"),
+                   ("glm", "glm", None, None),
+                   ("swe2", "devin", "swe-2", None)],
+        "design_review": [("astra6", "codex", "gpt-6-astra", "high"),
+                          ("opus55", "claude", "claude-opus-5-5", "medium"),
+                          ("glm", "glm", None, None),
+                          ("swe2", "devin", "swe-2", None)],
+        "build": [("sol61", "codex", "gpt-6.1-sol", "high"),
+                  ("sonnet", "claude", "claude-sonnet-5-5", "high"),
+                  ("glm", "glm", None, None),
+                  ("swe2", "devin", "swe-2", None)],
+        "build_review": [("glm", "glm", None, None),
+                         ("sonnet", "claude", "claude-sonnet-5-5", "medium"),
+                         ("sol61", "codex", "gpt-6.1-sol", "high"),
+                         ("swe2", "devin", "swe-2", None)],
+        "review_fix": [("sol61", "codex", "gpt-6.1-sol", "high"),
+                       ("sonnet", "claude", "claude-sonnet-5-5", "high"),
+                       ("glm", "glm", None, None),
+                       ("swe2", "devin", "swe-2", None)],
+        "re_review": [("glm", "glm", None, None),
+                      ("sol61", "codex", "gpt-6.1-sol", "high"),
+                      ("sonnet", "claude", "claude-sonnet-5-5", "medium"),
+                      ("swe2", "devin", "swe-2", None)],
+        "audit": [("fable", "claude", "claude-fable-5-1", "medium"),
+                  ("astra6", "codex", "gpt-6-astra", "high"),
+                  ("glm", "glm", None, None),
+                  ("swe2", "devin", "swe-2", None)],
+    }
+
+    for stage, exp_chain in expected.items():
+        got = [
+            (c.get("model"), c.get("provider"), c.get("id"), c.get("effort"))
+            for c in dm.get_stage_chain(stage, cfg_path)
+        ]
+        check(f"daemon stage chain {stage}", got == exp_chain, f"got={got} expected={exp_chain}")
+
+    check("daemon readonly stages",
+          all(dm.is_stage_readonly(s) for s in ("design", "design_review", "build_review", "re_review", "audit")), "")
+    check("daemon write stages",
+          all(not dm.is_stage_readonly(s) for s in ("build", "review_fix")), "")
+
+    # Command construction checks
+    c_cmd, c_env = dm.build_lane_command(
+        dm.get_stage_chain("design", cfg_path)[0], "/tmp/p.md", "/tmp", "/tmp/o.out", readonly=True
+    )
+    check("daemon claude opus55 medium cmd",
+          "--model" in c_cmd and "claude-opus-5-5" in c_cmd and "--effort" in c_cmd and "medium" in c_cmd,
+          str(c_cmd))
+    check("daemon claude config dir", c_env.get("CLAUDE_CONFIG_DIR") == "/home/box/.claude-fable", str(c_env.get("CLAUDE_CONFIG_DIR")))
+
+    x_cmd, _ = dm.build_lane_command(
+        dm.get_stage_chain("build", cfg_path)[0], "/tmp/p.md", "/tmp", "/tmp/o.out", readonly=False
+    )
+    check("daemon codex sol61 high write cmd",
+          "gpt-6.1-sol" in x_cmd and 'model_reasoning_effort="high"' in x_cmd and "workspace-write" in x_cmd,
+          str(x_cmd))
+
+    g_cmd, g_env = dm.build_lane_command(
+        dm.get_stage_chain("build_review", cfg_path)[0], "/tmp/p.md", "/tmp", "/tmp/o.out", readonly=True,
+        base_env={"CLAUDE_CONFIG_DIR": "/home/box/.claude-fable", "PATH": "/usr/bin"}
+    )
+    check("daemon glm unsets CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR" not in g_env, str(g_env))
+    check("daemon glm readonly flags", "--allowedTools" in g_cmd and "Read" in g_cmd, str(g_cmd))
+
+    d_cmd, _ = dm.build_lane_command(
+        dm.get_stage_chain("audit", cfg_path)[3], "/tmp/p.md", "/tmp", "/tmp/o.out", readonly=True
+    )
+    check("daemon devin swe-2 cmd", "--model" in d_cmd and "swe-2" in d_cmd and "auto" in d_cmd, str(d_cmd))
+
+    # Fallback execution check: primary fails with 429, 1st backup fails with quota, 2nd backup (GLM) succeeds
+    calls = []
+    outcomes = [
+        (1, "", "HTTP 429 rate limit reached"),
+        (0, "You've hit your usage limit. Resets in 2 hours", ""),
+        (0, "VERDICT: APPROVE\nAll checks passed.", ""),
+    ]
+
+    def fake_runner(choice, prompt, cwd, log_prefix, ro):
+        idx = len(calls)
+        calls.append(choice["model"])
+        return outcomes[idx]
+
+    res = dm.run_stage_chain("design", "design task", tmp_dir, tmp_dir, runner=fake_runner, config_path=cfg_path)
+    check("daemon fallback stops at 2nd backup (glm)",
+          calls == ["opus55", "astra6", "glm"] and res["choice"]["model"] == "glm" and len(res["skipped"]) == 2,
+          f"calls={calls} res={res}")
+    check("daemon verdict parse", dm.parse_verdict(res["text"]) == "APPROVE", str(res["text"]))
+
+    # Blueprint & 4-batch roadmap seeding
+    check("daemon blueprint is BLUEPRINT.md",
+          dcfg.get("blueprint") == "BLUEPRINT.md" and os.path.exists(os.path.join(ROOT, "BLUEPRINT.md")),
+          str(dcfg.get("blueprint")))
+    qdir = os.path.join(tmp_dir, "dev-queue")
+    seeded = dm.seed_roadmap_batches(qdir)
+    check("daemon seeds 4 roadmap batches", len(seeded) == 4, str(seeded))
+    seeded_again = dm.seed_roadmap_batches(qdir)
+    check("daemon seed idempotent", seeded_again == [], str(seeded_again))
+
+    # 10-PR audit trigger
+    check("daemon audit every 10 PRs",
+          dm.should_run_audit(10, 0) and dm.should_run_audit(20, 10)
+          and not dm.should_run_audit(9, 0) and not dm.should_run_audit(10, 10), "")
+
+
 def main():
     import tempfile
     print("offline tests for autobot.py")
@@ -590,6 +702,7 @@ def main():
         test_status(tempfile.mkdtemp(prefix="ab-status-"), server)
         test_status_write(tempfile.mkdtemp(prefix="ab-write-"))
         test_env_and_slack(tempfile.mkdtemp(prefix="ab-env-"))
+        test_daemon_stages_and_fallback(tempfile.mkdtemp(prefix="ab-daemon-"))
     finally:
         server.shutdown()
     print(f"\n{len(PASSES)} passed, {len(FAILURES)} failed")

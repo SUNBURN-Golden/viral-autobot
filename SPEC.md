@@ -11,3 +11,17 @@ Hard rules: no posting/commenting/DM/email/follow/login anywhere; no paid APIs; 
 0 */3 * * * cd /workspace/viral/autobot && /usr/bin/python3 autobot.py run >> logs/run.log 2>&1
 50 20 * * * cd /workspace/viral/autobot && /usr/bin/python3 autobot.py status >> logs/status.log 2>&1
 (box TZ is Asia/Seoul; include CRON_TZ=Asia/Seoul line). Do NOT install crontab and do NOT run the full crawl; just ensure `python3 -m py_compile` passes and `python3 autobot.py --help` works.
+
+## 7-Stage Dev & Blueprint-Audit Daemon (Updated 2026-10-23)
+
+Entry: `daemon.py` (or `python3 autobot.py daemon {start,stop,restart,status,stages,loop}`), configured via `config.json` -> `daemon`.
+
+| Stage | Primary | 1st Backup | 2nd Backup | 3rd Backup | Mode |
+| --- | --- | --- | --- | --- | --- |
+| 1. 설계 (`design`) | Opus 5.5 medium (`claude-opus-5-5`) | Codex astra 6 high (`gpt-6-astra`) | GLM | Swe2 (`swe-2`) | read-only |
+| 2. 설계리뷰 (`design_review`) | Codex astra 6 high (`gpt-6-astra`) | Opus 5.5 medium (`claude-opus-5-5`) | GLM | Swe2 (`swe-2`) | read-only |
+| 3. 개발 (`build`) | Codex sol 6.1 high (`gpt-6.1-sol`) | Claude Sonnet high (`claude-sonnet-5-5`) | GLM | Swe2 (`swe-2`) | write |
+| 4. 개발리뷰 (`build_review`) | GLM | Claude Sonnet 5.5 medium (`claude-sonnet-5-5`) | Codex sol 6.1 high (`gpt-6.1-sol`) | Swe2 (`swe-2`) | read-only |
+| 5. 리뷰에 따른 수정 (`review_fix`) | Codex sol 6.1 high (`gpt-6.1-sol`) | Claude Sonnet high (`claude-sonnet-5-5`) | GLM | Swe2 (`swe-2`) | write |
+| 6. 재리뷰 (`re_review`) | GLM | Codex sol 6.1 high (`gpt-6.1-sol`) | Claude Sonnet medium (`claude-sonnet-5-5`) | Swe2 (`swe-2`) | read-only |
+| 7. 10개 PR마다 감리 (`audit`) | Fable medium (`claude-fable-5-1`) | Codex astra 6 high (`gpt-6-astra`) | GLM | Swe2 (`swe-2`) | read-only |
