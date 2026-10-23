@@ -2112,6 +2112,11 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_daemon(args) -> int:
+    import daemon as daemon_mod
+    return daemon_mod.main(["--config", args.config, args.action])
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="autobot.py",
@@ -2143,6 +2148,12 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--post", action="store_true",
                     help="post out/status_slack.txt to Slack if a webhook is configured")
     st.set_defaults(func=cmd_status)
+
+    dm = sub.add_parser("daemon", help="7-stage dev & blueprint-audit daemon (start/stop/restart/status/stages)")
+    dm.add_argument("action", nargs="?", default="status",
+                    choices=["start", "stop", "restart", "status", "stages", "seed", "loop"],
+                    help="daemon action (default: status)")
+    dm.set_defaults(func=cmd_daemon)
     return parser
 
 

@@ -1,7 +1,12 @@
 {
   "user_agent": "SoulboundViralAutobot/1.0 (+https://hanset.soulbound.co.kr)",
   "campaign": "viral_w1",
-  "channels": ["x", "threads", "instagram", "reddit"],
+  "channels": [
+    "x",
+    "threads",
+    "instagram",
+    "reddit"
+  ],
   "paths": {
     "db": "data/autobot.db",
     "logs": "logs",
@@ -18,7 +23,10 @@
     "first_run_draft_pages": 5,
     "http_timeout": 20,
     "max_bytes": 2000000,
-    "request_sleep": [2.0, 5.0],
+    "request_sleep": [
+      2.0,
+      5.0
+    ],
     "reddit_min_sleep": 6.0,
     "max_reddit_requests_per_run": 40,
     "max_metric_checks_per_run": 40
@@ -36,14 +44,38 @@
         "크로스핏 드랍인",
         "한국 사우나 문신"
       ],
-      "hashtags": ["#CrossFit", "#HYROX", "#Seoul", "#KoreaTravel", "#jjimjilbang"],
+      "hashtags": [
+        "#CrossFit",
+        "#HYROX",
+        "#Seoul",
+        "#KoreaTravel",
+        "#jjimjilbang"
+      ],
       "rss_feeds": [],
       "aliases": {
-        "domains": ["hanset.soulbound.co.kr", "cfhannam.com"],
-        "names": ["hanset", "한셋", "crossfit hannam"],
+        "domains": [
+          "hanset.soulbound.co.kr",
+          "cfhannam.com"
+        ],
+        "names": [
+          "hanset",
+          "한셋",
+          "crossfit hannam"
+        ],
         "terms": [
-          "crossfit", "drop-in", "drop in", "hyrox", "jjimjilbang", "sauna",
-          "tattoo", "크로스핏", "드랍인", "하이록스", "사우나", "찜질방", "문신"
+          "crossfit",
+          "drop-in",
+          "drop in",
+          "hyrox",
+          "jjimjilbang",
+          "sauna",
+          "tattoo",
+          "크로스핏",
+          "드랍인",
+          "하이록스",
+          "사우나",
+          "찜질방",
+          "문신"
         ]
       }
     },
@@ -59,14 +91,35 @@
         "웹툰 리뷰",
         "웹소설 비평"
       ],
-      "hashtags": ["#webtoon", "#webnovel", "#KoreanLiterature", "#코믹스", "#웹소설"],
+      "hashtags": [
+        "#webtoon",
+        "#webnovel",
+        "#KoreanLiterature",
+        "#코믹스",
+        "#웹소설"
+      ],
       "rss_feeds": [],
       "aliases": {
-        "domains": ["goal-lit.soulbound.co.kr", "goallit.soulbound.co.kr"],
-        "names": ["goallit", "goal-lit", "골릿"],
+        "domains": [
+          "goal-lit.soulbound.co.kr",
+          "goallit.soulbound.co.kr"
+        ],
+        "names": [
+          "goallit",
+          "goal-lit",
+          "골릿"
+        ],
         "terms": [
-          "webtoon", "web novel", "webnovel", "web fiction", "korean literature",
-          "literature", "웹툰", "웹소설", "웹 소설", "한국 문학"
+          "webtoon",
+          "web novel",
+          "webnovel",
+          "web fiction",
+          "korean literature",
+          "literature",
+          "웹툰",
+          "웹소설",
+          "웹 소설",
+          "한국 문학"
         ]
       }
     },
@@ -82,14 +135,33 @@
         "한국 셰프",
         "서울 파인다이닝"
       ],
-      "hashtags": ["#FineDining", "#SeoulFood", "#Chef", "#KoreanFood", "#파인다이닝"],
+      "hashtags": [
+        "#FineDining",
+        "#SeoulFood",
+        "#Chef",
+        "#KoreanFood",
+        "#파인다이닝"
+      ],
       "rss_feeds": [],
       "aliases": {
-        "domains": ["kitchengenome.soulbound.co.kr"],
-        "names": ["kitchengenome", "kitchen genome", "키친지놈"],
+        "domains": [
+          "kitchengenome.soulbound.co.kr"
+        ],
+        "names": [
+          "kitchengenome",
+          "kitchen genome",
+          "키친지놈"
+        ],
         "terms": [
-          "chef", "fine dining", "culinary", "restauran", "요리", "셰프",
-          "파인다이닝", "파인 다이닝", "레스토랑"
+          "chef",
+          "fine dining",
+          "culinary",
+          "restauran",
+          "요리",
+          "셰프",
+          "파인다이닝",
+          "파인 다이닝",
+          "레스토랑"
         ]
       }
     },
@@ -105,7 +177,13 @@
         "공모전 마감",
         "유료 도서 리뷰"
       ],
-      "hashtags": ["#OpenCall", "#WritingCommunity", "#BookReview", "#공모전", "#창작"],
+      "hashtags": [
+        "#OpenCall",
+        "#WritingCommunity",
+        "#BookReview",
+        "#공모전",
+        "#창작"
+      ],
       "rss_feeds": [],
       "aliases": {
         "domains": [
@@ -115,11 +193,29 @@
           "goletter.co",
           "newsletter.place"
         ],
-        "names": ["pitchboard", "피치보드", "open calls by pitchboard"],
+        "names": [
+          "pitchboard",
+          "피치보드",
+          "open calls by pitchboard"
+        ],
         "terms": [
-          "open call", "call for submissions", "submissions", "grants deadline",
-          "grant", "book review", "book reviews", "books", "publishing", "writing",
-          "newsletter", "공모전", "원고", "지원금", "출판", "도서", "책"
+          "open call",
+          "call for submissions",
+          "submissions",
+          "grants deadline",
+          "grant",
+          "book review",
+          "book reviews",
+          "books",
+          "publishing",
+          "writing",
+          "newsletter",
+          "공모전",
+          "원고",
+          "지원금",
+          "출판",
+          "도서",
+          "책"
         ]
       }
     },
@@ -128,17 +224,253 @@
       "url": null,
       "tagline_en": "agamajung - baby gear and stroller deal notes for Korea",
       "tagline_ko": "아가마중 - 국내 유아용품·유모차 혜택 정보",
-      "keywords": ["baby gear korea", "stroller deal", "유아용품", "유모차 할인"],
-      "hashtags": ["#BabyGear", "#Stroller", "#육아", "#유아용품"],
+      "keywords": [
+        "baby gear korea",
+        "stroller deal",
+        "유아용품",
+        "유모차 할인"
+      ],
+      "hashtags": [
+        "#BabyGear",
+        "#Stroller",
+        "#육아",
+        "#유아용품"
+      ],
       "rss_feeds": [],
       "aliases": {
         "domains": [],
-        "names": ["agamajung", "아가마중"],
+        "names": [
+          "agamajung",
+          "아가마중"
+        ],
         "terms": [
-          "baby gear", "stroller", "baby", "유아용품", "유모차", "아기", "육아"
+          "baby gear",
+          "stroller",
+          "baby",
+          "유아용품",
+          "유모차",
+          "아기",
+          "육아"
         ]
       },
       "blocker_note": "공개 URL 없음"
     }
-  ]
+  ],
+  "daemon": {
+    "updated_at": "2026-10-23T19:47:00+09:00",
+    "repo": "SUNBURN-Golden/viral-autobot",
+    "blueprint": "BLUEPRINT.md",
+    "audit_every_prs": 10,
+    "poll_seconds": 15,
+    "queue_dir": "data/dev-queue",
+    "pid_file": "logs/daemon.pid",
+    "lock_file": "logs/daemon.lock",
+    "log_file": "logs/daemon.log",
+    "models": {
+      "opus55": {
+        "provider": "claude",
+        "id": "claude-opus-5-5",
+        "alias": "opus",
+        "config_dir": "/home/box/.claude-fable",
+        "label": "Opus 5.5"
+      },
+      "astra6": {
+        "provider": "codex",
+        "id": "gpt-6-astra",
+        "label": "Codex astra 6"
+      },
+      "sol61": {
+        "provider": "codex",
+        "id": "gpt-6.1-sol",
+        "label": "Codex sol 6.1"
+      },
+      "sonnet": {
+        "provider": "claude",
+        "id": "claude-sonnet-5-5",
+        "alias": "sonnet",
+        "config_dir": "/home/box/.claude-fable",
+        "label": "Claude Sonnet 5.5"
+      },
+      "fable": {
+        "provider": "claude",
+        "id": "claude-fable-5-1",
+        "alias": "fable",
+        "config_dir": "/home/box/.claude-fable",
+        "label": "Fable"
+      },
+      "glm": {
+        "provider": "glm",
+        "id": "default",
+        "label": "GLM"
+      },
+      "swe2": {
+        "provider": "devin",
+        "id": "swe-2",
+        "label": "Swe2"
+      }
+    },
+    "stages": {
+      "design": [
+        {
+          "model": "opus55",
+          "provider": "claude",
+          "id": "claude-opus-5-5",
+          "effort": "medium"
+        },
+        {
+          "model": "astra6",
+          "provider": "codex",
+          "id": "gpt-6-astra",
+          "effort": "high"
+        },
+        {
+          "model": "glm",
+          "provider": "glm"
+        },
+        {
+          "model": "swe2",
+          "provider": "devin",
+          "id": "swe-2"
+        }
+      ],
+      "design_review": [
+        {
+          "model": "astra6",
+          "provider": "codex",
+          "id": "gpt-6-astra",
+          "effort": "high"
+        },
+        {
+          "model": "opus55",
+          "provider": "claude",
+          "id": "claude-opus-5-5",
+          "effort": "medium"
+        },
+        {
+          "model": "glm",
+          "provider": "glm"
+        },
+        {
+          "model": "swe2",
+          "provider": "devin",
+          "id": "swe-2"
+        }
+      ],
+      "build": [
+        {
+          "model": "sol61",
+          "provider": "codex",
+          "id": "gpt-6.1-sol",
+          "effort": "high"
+        },
+        {
+          "model": "sonnet",
+          "provider": "claude",
+          "id": "claude-sonnet-5-5",
+          "effort": "high"
+        },
+        {
+          "model": "glm",
+          "provider": "glm"
+        },
+        {
+          "model": "swe2",
+          "provider": "devin",
+          "id": "swe-2"
+        }
+      ],
+      "build_review": [
+        {
+          "model": "glm",
+          "provider": "glm"
+        },
+        {
+          "model": "sonnet",
+          "provider": "claude",
+          "id": "claude-sonnet-5-5",
+          "effort": "medium"
+        },
+        {
+          "model": "sol61",
+          "provider": "codex",
+          "id": "gpt-6.1-sol",
+          "effort": "high"
+        },
+        {
+          "model": "swe2",
+          "provider": "devin",
+          "id": "swe-2"
+        }
+      ],
+      "review_fix": [
+        {
+          "model": "sol61",
+          "provider": "codex",
+          "id": "gpt-6.1-sol",
+          "effort": "high"
+        },
+        {
+          "model": "sonnet",
+          "provider": "claude",
+          "id": "claude-sonnet-5-5",
+          "effort": "high"
+        },
+        {
+          "model": "glm",
+          "provider": "glm"
+        },
+        {
+          "model": "swe2",
+          "provider": "devin",
+          "id": "swe-2"
+        }
+      ],
+      "re_review": [
+        {
+          "model": "glm",
+          "provider": "glm"
+        },
+        {
+          "model": "sol61",
+          "provider": "codex",
+          "id": "gpt-6.1-sol",
+          "effort": "high"
+        },
+        {
+          "model": "sonnet",
+          "provider": "claude",
+          "id": "claude-sonnet-5-5",
+          "effort": "medium"
+        },
+        {
+          "model": "swe2",
+          "provider": "devin",
+          "id": "swe-2"
+        }
+      ],
+      "audit": [
+        {
+          "model": "fable",
+          "provider": "claude",
+          "id": "claude-fable-5-1",
+          "effort": "medium"
+        },
+        {
+          "model": "astra6",
+          "provider": "codex",
+          "id": "gpt-6-astra",
+          "effort": "high"
+        },
+        {
+          "model": "glm",
+          "provider": "glm"
+        },
+        {
+          "model": "swe2",
+          "provider": "devin",
+          "id": "swe-2"
+        }
+      ]
+    }
+  }
 }
