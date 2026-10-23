@@ -67,6 +67,12 @@ ACCEPT_JSON = "application/json;q=0.9,*/*;q=0.8"
 
 UNKNOWN = "미확인"
 DIRECT_UNKNOWN = "직접 유입/출처 미확인"
+JUDGMENT_HOLD = "판정 보류"
+FAILURE_CLASSES = ("low_impressions", "low_ctr", "high_bounce", "low_signup", "low_retention")
+DIAG_VERDICTS = ("diagnosed", JUDGMENT_HOLD, "pass")
+METRIC_WINDOWS = ("48h", "7d")
+EXPERIMENT_VARIABLES = ("hook_type", "channel", "landing_page", "posting_window")
+POSTING_WINDOWS = (("dawn", 0), ("morning", 6), ("afternoon", 12), ("evening", 18))
 TIER_METRICS = {
     1: {"views", "likes", "comments", "score"},
     2: {"reach", "shares", "saves", "watch", "link_clicks"},
@@ -246,6 +252,13 @@ def load_config(path: str) -> dict:
                         "evidence": {"dir": "data/evidence", "expiry_warn_days": 7},
                         "questions": {"dir": "data/questions"},
                         "metrics": {"dir": "data/metrics"},
+                        "paths": {"rules": "data/rules.json"},
+                        "experiments": {"max_units": 6, "window_days": 14,
+                                        "max_active_per_variable": 1},
+                        "diagnosis": {"min_sample": 30, "min_impressions": 100, "min_ctr": .02,
+                                      "max_bounce_rate": .7, "min_signup_rate": .05,
+                                      "min_revisit_rate": .1},
+                        "rules": {"regression_tolerance": .2},
                         "hooks": {"types": list(HOOK_TYPES), "default": "loss_prevention",
                                   "banned_terms": list(BAIT_TERMS)}})
     limits.setdefault("max_question_drafts_per_run", 5)
@@ -461,6 +474,51 @@ CREATE TABLE IF NOT EXISTS hooks (
   language TEXT NOT NULL, text TEXT NOT NULL, evidence_ids TEXT NOT NULL DEFAULT '[]',
   status TEXT NOT NULL CHECK (status IN ('ok','blocked')), blocked_terms TEXT,
   created TEXT NOT NULL, UNIQUE (question_id, hook_type)
+);
+CREATE TABLE IF NOT EXISTS experiments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project TEXT NOT NULL, experiment_key TEXT NOT NULL,
+  variable TEXT NOT NULL CHECK (variable IN ('hook_type','channel','landing_page','posting_window')),
+  hypothesis TEXT NOT NULL, window_start TEXT NOT NULL, window_end TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running','concluded')),
+  verdict TEXT CHECK (verdict IS NULL OR verdict = '판정 보류' OR verdict LIKE 'winner:%'),
+  result TEXT, concluded_at TEXT, created TEXT NOT NULL, updated TEXT NOT NULL,
+  UNIQUE (project, experiment_key)
+);
+CREATE TABLE IF NOT EXISTS experiment_units (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  experiment_id INTEGER NOT NULL REFERENCES experiments(id),
+  unit_key TEXT NOT NULL, variable_value TEXT NOT NULL, label TEXT,
+  post_id TEXT, created TEXT NOT NULL,
+  UNIQUE (experiment_id, unit_key), UNIQUE (experiment_id, variable_value),
+  UNIQUE (experiment_id, post_id)
+);
+CREATE TABLE IF NOT EXISTS diagnoses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project TEXT NOT NULL, post_id TEXT NOT NULL, experiment_id INTEGER,
+  check_kind TEXT NOT NULL CHECK (check_kind IN ('48h','7d')),
+  verdict TEXT NOT NULL CHECK (verdict IN ('diagnosed','판정 보류','pass')),
+  category TEXT CHECK (category IS NULL OR category IN
+    ('low_impressions','low_ctr','high_bounce','low_signup','low_retention')),
+  hypothesis TEXT NOT NULL, numerator REAL, denominator REAL, denominator_kind TEXT,
+  actual_with_denominator TEXT NOT NULL, alternative_causes TEXT NOT NULL,
+  next_single_change TEXT NOT NULL, created TEXT NOT NULL, updated TEXT NOT NULL,
+  CHECK ((verdict = 'pass') = (category IS NULL)), UNIQUE (post_id, check_kind)
+);
+CREATE TABLE IF NOT EXISTS brand_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project TEXT NOT NULL, rule_key TEXT NOT NULL, rule_value TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded','rolled_back')),
+  reason TEXT, source TEXT NOT NULL, baseline_rate REAL,
+  created TEXT NOT NULL, updated TEXT NOT NULL, UNIQUE (project, rule_key, version)
+);
+CREATE TABLE IF NOT EXISTS rule_checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  rule_id INTEGER NOT NULL REFERENCES brand_rules(id),
+  verdict TEXT NOT NULL CHECK (verdict IN ('ok','판정 보류','regressed')),
+  baseline_rate REAL, actual_rate REAL, numerator REAL, denominator REAL,
+  actual_with_denominator TEXT NOT NULL, created TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS blockers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3244,6 +3302,377 @@ def _short_result(result: dict) -> str:
 
 
 # --------------------------------------------------------------------------
+# experiments / diagnosis / rules
+# --------------------------------------------------------------------------
+
+def _funnel(conn, post_id, window) -> dict:
+    """Read latest non-null cumulative snapshots, never add repeated imports."""
+    if window not in METRIC_WINDOWS:
+        raise ValueError("window must be 48h or 7d")
+
+    def latest(tier, metric):
+        row = conn.execute(
+            "SELECT value FROM metric_observations WHERE post_id=? AND window=? "
+            "AND tier=? AND metric=? AND value IS NOT NULL "
+            "ORDER BY observed_at DESC,id DESC LIMIT 1", (post_id, window, tier, metric)).fetchone()
+        return row[0] if row else None
+
+    reach = latest(2, "reach")
+    return {"impressions": reach if reach is not None else latest(1, "views"),
+            "clicks": latest(2, "link_clicks"), "engaged": latest(3, "resource_views"),
+            "signups": latest(3, "signups"), "revisits": latest(3, "revisits"),
+            "ignored_observations": conn.execute(
+                "SELECT COUNT(*) FROM metric_observations WHERE post_id=? "
+                "AND (window IS NULL OR window NOT IN ('48h','7d'))", (post_id,)).fetchone()[0]}
+
+
+def create_experiment(conn, cfg, project, experiment_key, variable, hypothesis, units, now) -> int:
+    if project not in {p.name for p in cfg["_projects"]}:
+        raise ValueError("unknown project")
+    if variable not in EXPERIMENT_VARIABLES:
+        raise ValueError("unknown experiment variable")
+    if not isinstance(hypothesis, str) or not hypothesis.strip() or not experiment_key:
+        raise ValueError("experiment key and hypothesis are required")
+    if not 1 <= len(units) <= min(6, cfg["experiments"]["max_units"]):
+        raise ValueError("experiment requires 1 to 6 units (within configured limit)")
+    keys, values = set(), set()
+    for unit in units:
+        key, value = unit.get("unit_key"), unit.get("variable_value")
+        if not isinstance(key, str) or not key.strip() or not isinstance(value, str) or not value.strip():
+            raise ValueError("unit_key and variable_value are required text")
+        if key == "leader" or key in keys or value in values:
+            raise ValueError("unit keys and variable values must be unique; leader is reserved")
+        if variable == "hook_type" and value not in HOOK_TYPES:
+            raise ValueError("unknown hook type")
+        keys.add(key)
+        values.add(value)
+    with conn:
+        if conn.execute("SELECT 1 FROM experiments WHERE project=? AND variable=? AND status='running'",
+                        (project, variable)).fetchone():
+            raise ValueError("a running experiment already tests this variable")
+        if conn.execute("SELECT 1 FROM experiments WHERE project=? AND experiment_key=?",
+                        (project, experiment_key)).fetchone():
+            raise ValueError("experiment key already exists")
+        cur = conn.execute(
+            "INSERT INTO experiments (project,experiment_key,variable,hypothesis,window_start,window_end,created,updated) "
+            "VALUES (?,?,?,?,?,?,?,?)", (project, experiment_key, variable, hypothesis.strip(), iso(now),
+                                        iso(now + timedelta(days=cfg["experiments"]["window_days"])), iso(now), iso(now)))
+        experiment_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO experiment_units (experiment_id,unit_key,variable_value,label,created) VALUES (?,?,?,?,?)",
+            [(experiment_id, u["unit_key"], u["variable_value"], u.get("label"), iso(now)) for u in units])
+    return experiment_id
+
+
+def _post_levers(row) -> dict:
+    published = parse_iso(row["published_at"])
+    hour = kst(published).hour if published else None
+    return {"hook_type": row["hook_type"], "channel": row["channel"],
+            "landing_page": normalize_url(row["target_url"] or "") or None,
+            "posting_window": next((name for name, start in reversed(POSTING_WINDOWS)
+                                    if hour is not None and hour >= start), None)}
+
+
+def _experiment(conn, experiment_id):
+    row = conn.execute("SELECT * FROM experiments WHERE id=?", (experiment_id,)).fetchone()
+    if row is None:
+        raise ValueError("unknown experiment")
+    return row
+
+
+def attach_experiment_post(conn, cfg, experiment_id, unit_key, post_id, now) -> None:
+    with conn:
+        exp = _experiment(conn, experiment_id)
+        unit = conn.execute("SELECT * FROM experiment_units WHERE experiment_id=? AND unit_key=?",
+                            (experiment_id, unit_key)).fetchone()
+        if exp["status"] != "running" or unit is None or unit["post_id"] is not None:
+            raise ValueError("a running experiment and unattached unit are required")
+        post = conn.execute("SELECT * FROM published WHERE post_id=?", (post_id,)).fetchone()
+        if post is None or post["project"] != exp["project"] or post["state"] not in POST_FLOW[4:]:
+            raise ValueError("post must be verified and belong to the experiment brand")
+        published = parse_iso(post["published_at"])
+        if not published or not kst(parse_iso(exp["window_start"])) <= kst(published) <= kst(parse_iso(exp["window_end"])):
+            raise ValueError("post is outside the experiment window")
+        levers = _post_levers(post)
+        if levers[exp["variable"]] != unit["variable_value"]:
+            raise ValueError("post does not match the tested value")
+        others = conn.execute(
+            "SELECT p.* FROM published p JOIN experiment_units u ON u.post_id=p.post_id "
+            "WHERE u.experiment_id=?", (experiment_id,)).fetchall()
+        if any(p["post_id"] == post_id for p in others):
+            raise ValueError("post is already attached")
+        for lever, value in levers.items():
+            if lever == exp["variable"]:
+                continue
+            if not value or value == UNKNOWN:
+                raise ValueError("비교 가능성 미확인: " + lever)
+            if any(_post_levers(p)[lever] != value for p in others):
+                raise ValueError("only the tested variable may differ: " + lever)
+        conn.execute("UPDATE experiment_units SET post_id=? WHERE id=?", (post_id, unit["id"]))
+        conn.execute("UPDATE experiments SET updated=? WHERE id=?", (iso(now), experiment_id))
+
+
+def list_experiments(conn, project=None, status=None) -> list:
+    if status is not None and status not in ("running", "concluded"):
+        raise ValueError("invalid experiment status")
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM experiments WHERE (? IS NULL OR project=?) AND (? IS NULL OR status=?) ORDER BY id",
+        (project, project, status, status))]
+
+
+def experiment_units_summary(conn, experiment_id) -> list:
+    _experiment(conn, experiment_id)
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM experiment_units WHERE experiment_id=? ORDER BY id", (experiment_id,))]
+
+
+_DIAGNOSIS_GUIDANCE = {
+    "low_impressions": ("채널과 게시 시점이 대상 독자에게 도달할 것이다",
+                        ["채널 적합성", "게시 시점", "계정 상태", "표현"], "게시 시간대 하나 변경"),
+    "low_ctr": ("훅이 독자의 클릭 이유를 제공할 것이다",
+                ["대상 독자 불일치", "훅의 구체성", "CTA 명확성"], "훅 유형 하나 변경"),
+    "high_bounce": ("도착 페이지가 제목의 약속을 이행할 것이다",
+                    ["제목과 도착 페이지 불일치", "페이지 로딩 지연"], "도착 페이지 하나 변경"),
+    "low_signup": ("자료 열람 후 가입할 이유가 충분할 것이다",
+                   ["가입 혜택 불명확", "입력 부담"], "가입 이유 문구 하나 변경"),
+    "low_retention": ("가입 후 후속 정보가 재방문을 만들 것이다",
+                      ["후속 정보 가치 부족", "갱신 주기"], "후속 정보 갱신 주기 하나 변경"),
+}
+
+
+def diagnose_post(conn, cfg, post_id, check_kind, now) -> dict:
+    f = _funnel(conn, post_id, check_kind)
+    post = conn.execute("SELECT * FROM published WHERE post_id=?", (post_id,)).fetchone()
+    if post is None or not post["project"] or post["state"] not in POST_FLOW[4:]:
+        raise ValueError("a verified brand post is required")
+    d = cfg["diagnosis"]
+    sample = d["min_sample"]
+    stages = [
+        ("low_impressions", f["impressions"], d["min_impressions"], "reach", "기준", "threshold"),
+        ("low_ctr", f["clicks"], f["impressions"], "link_clicks", "reach", "count"),
+        ("high_bounce", f["engaged"], f["clicks"], "resource_views", "link_clicks", "count"),
+        ("low_signup", f["signups"], f["engaged"], "signups", "resource_views", "count"),
+        ("low_retention", f["revisits"], f["signups"], "revisits", "signups", "count"),
+    ]
+    verdict = "pass"
+    category = None
+    for cat, num, den, metric, den_metric, kind in stages:
+        held = num is None or den is None or (num < sample if kind == "threshold" else den < sample)
+        rate = num / den if num is not None and den else None
+        failed = not held and {
+            "low_impressions": lambda: num < den,
+            "low_ctr": lambda: rate < d["min_ctr"],
+            "high_bounce": lambda: 1 - rate > d["max_bounce_rate"],
+            "low_signup": lambda: rate < d["min_signup_rate"],
+            "low_retention": lambda: rate < d["min_revisit_rate"],
+        }[cat]()
+        if held or failed:
+            verdict, category = (JUDGMENT_HOLD if held else "diagnosed"), cat
+            break
+    actual = f"{metric} {num:g}" if num is not None else f"{metric} {UNKNOWN}"
+    actual += f" / {den_metric} {den:g}" if den is not None else f" / {den_metric} {UNKNOWN}"
+    actual += " (min_impressions)" if kind == "threshold" else (f" ({rate:.1%})" if rate is not None else "")
+    hypothesis, alternatives, change = _DIAGNOSIS_GUIDANCE[category] if category else (
+        "전 단계 기준 통과", [], "변경 없음 — 현 규칙 유지")
+    if verdict == JUDGMENT_HOLD:
+        count = num if kind == "threshold" else den
+        change = f"변경 없음 — 표본 추가 수집 (분모 {count if count is not None else UNKNOWN}/{sample})"
+    report = dict(hypothesis=hypothesis, actual_with_denominator=actual,
+                  alternative_causes=alternatives, next_single_change=change, verdict=verdict,
+                  category=category, numerator=num, denominator=den, denominator_kind=kind, check_kind=check_kind)
+    attached = conn.execute("SELECT experiment_id FROM experiment_units WHERE post_id=? ORDER BY id DESC LIMIT 1",
+                            (post_id,)).fetchone()
+    with conn:
+        conn.execute(
+            "INSERT INTO diagnoses (project,post_id,experiment_id,check_kind,verdict,category,hypothesis,numerator,"
+            "denominator,denominator_kind,actual_with_denominator,alternative_causes,next_single_change,created,updated) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(post_id,check_kind) DO UPDATE SET "
+            "experiment_id=excluded.experiment_id,verdict=excluded.verdict,category=excluded.category,"
+            "hypothesis=excluded.hypothesis,numerator=excluded.numerator,denominator=excluded.denominator,"
+            "denominator_kind=excluded.denominator_kind,actual_with_denominator=excluded.actual_with_denominator,"
+            "alternative_causes=excluded.alternative_causes,next_single_change=excluded.next_single_change,updated=excluded.updated",
+            (post["project"], post_id, attached[0] if attached else None, check_kind, verdict, category,
+             hypothesis, num, den, kind, actual, json.dumps(alternatives, ensure_ascii=False), change, iso(now), iso(now)))
+        state = post["state"]
+        if can_transition(state, "measured"):
+            state = transition(conn, "post", post["id"], "measured", now, "지표 진단")
+        if check_kind == "7d" and verdict != JUDGMENT_HOLD and can_transition(state, "evaluated"):
+            transition(conn, "post", post["id"], "evaluated", now, "7d 진단 완료")
+    return report
+
+
+def evaluate_experiment(conn, cfg, experiment_id, now) -> dict:
+    exp = _experiment(conn, experiment_id)
+    if exp["status"] == "concluded":
+        return {"status": exp["status"], "verdict": exp["verdict"], "result": json.loads(exp["result"])}
+    if kst(now) < kst(parse_iso(exp["window_end"])):
+        return {"status": "running", "verdict": None}
+    result = {}
+    units = experiment_units_summary(conn, experiment_id)
+    for window in ("7d", "48h"):
+        scores = {}
+        sufficient = True
+        for u in units:
+            f = _funnel(conn, u["post_id"], window)
+            num, den = f["signups"], f["engaged"]
+            scores[u["unit_key"]] = {"rate": num / den if num is not None and den else None,
+                                     "num": num, "den": den,
+                                     "ctr": f["clicks"] / f["impressions"]
+                                     if f["clicks"] is not None and f["impressions"] else None}
+            if not u["post_id"] or den is None or den < cfg["diagnosis"]["min_sample"] or num is None:
+                sufficient = False
+        leader = None
+        if sufficient:
+            rank = lambda key: (scores[key]["rate"], scores[key]["ctr"] if scores[key]["ctr"] is not None else -1)
+            ordered = sorted(scores, key=rank, reverse=True)
+            if len(ordered) == 1 or rank(ordered[0]) != rank(ordered[1]):
+                leader = ordered[0]
+        result[window] = dict(scores, leader=leader)
+    winner = result["7d"]["leader"]
+    result["winner_value"] = next((u["variable_value"] for u in units if u["unit_key"] == winner), None)
+    result["winner_rate"] = result["7d"][winner]["rate"] if winner else None
+    verdict = "winner:" + winner if winner else JUDGMENT_HOLD
+    with conn:
+        conn.execute("UPDATE experiments SET status='concluded',verdict=?,result=?,concluded_at=?,updated=? WHERE id=?",
+                     (verdict, json.dumps(result, ensure_ascii=False), iso(now), iso(now), experiment_id))
+    return {"status": "concluded", "verdict": verdict, "result": result}
+
+
+def active_rules(conn, project) -> dict:
+    return {r["rule_key"]: {"value": r["rule_value"], "version": r["version"]} for r in conn.execute(
+        "SELECT * FROM brand_rules WHERE project=? AND status='active' ORDER BY version", (project,))}
+
+
+def write_rules(conn, cfg) -> str:
+    """The DB is authoritative; replace the derived JSON file atomically."""
+    import tempfile
+    path = abs_path(cfg, "rules")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    projects = {r[0] for r in conn.execute("SELECT DISTINCT project FROM brand_rules")}
+    payload = {"generated": iso(now_kst()), "projects": {p: active_rules(conn, p) for p in sorted(projects)}}
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path), delete=False) as fh:
+            temporary = fh.name
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+    return path
+
+
+def promote_rule(conn, cfg, project, rule_key, rule_value, now, source) -> int:
+    if not isinstance(source, dict) or type(source.get("experiment_id")) is not int:
+        raise ValueError("experiment evidence is required")
+
+    def evidence(experiment_id):
+        e = _experiment(conn, experiment_id)
+        if e["project"] != project or e["variable"] != rule_key or e["status"] != "concluded" or not (e["verdict"] or "").startswith("winner:"):
+            raise ValueError("a concluded winning experiment for this brand and variable is required")
+        result = json.loads(e["result"])
+        if result["winner_value"] != rule_value:
+            raise ValueError("rule value must equal the experiment winner")
+        return e, result
+
+    exp, result = evidence(source["experiment_id"])
+    confirm = source.get("confirm_experiment_id")
+    if confirm is not None:
+        if type(confirm) is not int or confirm == exp["id"]:
+            raise ValueError("confirmation must be a different experiment")
+        evidence(confirm)
+    elif result["48h"]["leader"] != exp["verdict"].split(":", 1)[1]:
+        raise ValueError("재검증 필요: both windows or a confirming experiment must agree")
+    with conn:
+        version = conn.execute("SELECT COALESCE(MAX(version),0)+1 FROM brand_rules WHERE project=? AND rule_key=?",
+                               (project, rule_key)).fetchone()[0]
+        conn.execute("UPDATE brand_rules SET status='superseded',updated=? WHERE project=? AND rule_key=? AND status='active'",
+                     (iso(now), project, rule_key))
+        cur = conn.execute(
+            "INSERT INTO brand_rules (project,rule_key,rule_value,version,source,baseline_rate,created,updated) "
+            "VALUES (?,?,?,?,?,?,?,?)", (project, rule_key, rule_value, version,
+                                        json.dumps(source, ensure_ascii=False), result["winner_rate"], iso(now), iso(now)))
+        rule_id = cur.lastrowid
+    write_rules(conn, cfg)
+    return rule_id
+
+
+def rollback_rule(conn, cfg, project, rule_key, now, reason="") -> dict:
+    with conn:
+        active = conn.execute("SELECT * FROM brand_rules WHERE project=? AND rule_key=? AND status='active'",
+                              (project, rule_key)).fetchone()
+        if active is None:
+            raise ValueError("no active rule to roll back")
+        previous = conn.execute(
+            "SELECT * FROM brand_rules WHERE project=? AND rule_key=? AND status='superseded' "
+            "AND version<? ORDER BY version DESC LIMIT 1", (project, rule_key, active["version"])).fetchone()
+        conn.execute("UPDATE brand_rules SET status='rolled_back',reason=?,updated=? WHERE id=?",
+                     (reason, iso(now), active["id"]))
+        if previous:
+            conn.execute("UPDATE brand_rules SET status='active',updated=? WHERE id=?", (iso(now), previous["id"]))
+    write_rules(conn, cfg)
+    return {"rolled_back": active["version"], "restored": previous["version"] if previous else None}
+
+
+def check_rule_regression(conn, cfg, project, rule_key, now) -> dict:
+    rule = conn.execute("SELECT * FROM brand_rules WHERE project=? AND rule_key=? AND status='active'",
+                        (project, rule_key)).fetchone()
+    if rule is None:
+        return {"verdict": None}
+    num, den = 0, 0
+    for post in conn.execute("SELECT * FROM published WHERE project=? AND verified_at IS NOT NULL", (project,)):
+        verified = parse_iso(post["verified_at"])
+        if not verified or kst(verified) < kst(parse_iso(rule["created"])) or _post_levers(post)[rule_key] != rule["rule_value"]:
+            continue
+        f = _funnel(conn, post["post_id"], "7d")
+        # Never treat an unknown numerator as zero or count its denominator.
+        if f["signups"] is not None and f["engaged"] is not None:
+            num += f["signups"]
+            den += f["engaged"]
+    rate = num / den if den else None
+    baseline = rule["baseline_rate"]
+    verdict = JUDGMENT_HOLD if den < cfg["diagnosis"]["min_sample"] or baseline is None else (
+        "regressed" if rate < baseline * (1 - cfg["rules"]["regression_tolerance"]) else "ok")
+    actual = f"signups {num:g} / resource_views {den:g}" + (f" ({rate:.1%})" if rate is not None else "")
+    with conn:
+        conn.execute(
+            "INSERT INTO rule_checks (rule_id,verdict,baseline_rate,actual_rate,numerator,denominator,actual_with_denominator,created) "
+            "VALUES (?,?,?,?,?,?,?,?)", (rule["id"], verdict, baseline, rate, num, den, actual, iso(now)))
+    rolled_back = None
+    if verdict == "regressed":
+        rolled_back = rollback_rule(conn, cfg, project, rule_key, now,
+                                    reason=f"성과 악화: {actual} < 기준 {baseline}")
+    return dict(verdict=verdict, actual_rate=rate, baseline_rate=baseline,
+                numerator=num, denominator=den, rolled_back=rolled_back)
+
+
+def run_diagnostics(conn, cfg, projects, now) -> dict:
+    report = dict(diagnosed=0, held=0, passed=0, evaluated=0, rule_checks=0, rolled_back=0)
+    selected = {p.name for p in projects}
+    # Materialize before state changes: both completed windows must be processed.
+    rows = conn.execute(
+        "SELECT p.post_id,p.project,mc.check_kind FROM published p JOIN metric_checks mc ON mc.published_id=p.id "
+        "WHERE p.state IN ('published_verified','measured') AND mc.status='done' AND mc.check_kind IN ('48h','7d') "
+        "AND NOT EXISTS (SELECT 1 FROM diagnoses d WHERE d.post_id=p.post_id AND d.check_kind=mc.check_kind) "
+        "ORDER BY p.id,CASE mc.check_kind WHEN '48h' THEN 0 ELSE 1 END").fetchall()
+    for row in rows:
+        if row["project"] in selected:
+            result = diagnose_post(conn, cfg, row["post_id"], row["check_kind"], now)
+            report[{"diagnosed": "diagnosed", JUDGMENT_HOLD: "held", "pass": "passed"}[result["verdict"]]] += 1
+    for exp in list_experiments(conn, status="running"):
+        if exp["project"] in selected and kst(parse_iso(exp["window_end"])) <= kst(now):
+            evaluate_experiment(conn, cfg, exp["id"], now)
+            report["evaluated"] += 1
+    for rule in conn.execute("SELECT project,rule_key FROM brand_rules WHERE status='active'").fetchall():
+        if rule["project"] in selected:
+            result = check_rule_regression(conn, cfg, rule["project"], rule["rule_key"], now)
+            report["rule_checks"] += 1
+            report["rolled_back"] += int(bool(result["rolled_back"]))
+    return report
+
+
+# --------------------------------------------------------------------------
 # 5. status rendering
 # --------------------------------------------------------------------------
 
@@ -3283,6 +3712,12 @@ def collect_status(conn: sqlite3.Connection, cfg: dict, now: datetime) -> dict:
             "metrics": _metrics_cell(conn, proj.name),
             "tier_metrics": insights["brands"].get(proj.name, {}).get("counts", {1: 0, 2: 0, 3: 0}),
             "unattributed": insights["brands"].get(proj.name, {}).get("unattributed", 0),
+            "diagnoses": dict(conn.execute(
+                "SELECT verdict,COUNT(*) FROM diagnoses WHERE project=? GROUP BY verdict", (proj.name,)).fetchall()),
+            "ignored_observations": conn.execute(
+                "SELECT COUNT(*) FROM metric_observations WHERE brand=? "
+                "AND (window IS NULL OR window NOT IN ('48h','7d'))", (proj.name,)).fetchone()[0],
+            "rules": active_rules(conn, proj.name),
             "questions": Counter({r["state"]: r["n"] for r in conn.execute(
                 "SELECT state,COUNT(*) AS n FROM questions WHERE project=? GROUP BY state", (proj.name,))}),
             "evidence": Counter({r["status"]: r["n"] for r in conn.execute(
@@ -3363,6 +3798,9 @@ def render_status_md(status: dict, cfg: dict, now: datetime, mode: str) -> str:
         tiers = row.get("tier_metrics", {})
         lines.append(f"- metrics: {name} — t1 n={tiers.get(1, 0)} t2 n={tiers.get(2, 0)} "
                      f"t3 n={tiers.get(3, 0)} 미식별 n={row.get('unattributed', 0)}")
+        lines.append(f"- diagnosis: {name} — {row.get('diagnoses', {})}; "
+                     f"기간 미지정/미지원 관측 {row.get('ignored_observations', 0)}; "
+                     f"rules {row.get('rules', {})}")
     lines += [
         "",
         "## notes",
@@ -3546,6 +3984,7 @@ def cmd_run(args) -> int:
             process_rounds_log(conn, cfg, now_kst())
             run_due_checks(conn, fetcher, cfg, now_kst())
             import_metrics_dir(conn, cfg, projects, now_kst())
+            run_diagnostics(conn, cfg, projects, now_kst())
         except Exception as exc:
             log.exception("[metrics] failed: %s", type(exc).__name__)
 
@@ -3574,6 +4013,7 @@ def cmd_status(args) -> int:
     process_rounds_log(conn, cfg, now_kst())
     run_due_checks(conn, fetcher, cfg, now_kst())
     import_metrics_dir(conn, cfg, cfg["_projects"], now_kst())
+    run_diagnostics(conn, cfg, cfg["_projects"], now_kst())
     write_status(conn, cfg, now_kst(), mode="status")
     if args.post:
         slack_text = open(abs_path(cfg, "status_slack"), encoding="utf-8").read()
@@ -3642,6 +4082,66 @@ def cmd_metrics(args) -> int:
         return 2 if result.get("rejected", 0) else 0
     except (ValueError, TypeError) as exc:
         print(f"metrics error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+
+def cmd_experiments(args) -> int:
+    cfg = load_config(args.config)
+    conn = db_connect(cfg)
+    now = now_kst()
+    try:
+        if getattr(args, "project", None):
+            pick_projects(cfg, [args.project])
+        if args.action == "create":
+            units = []
+            for item in args.unit:
+                key, sep, value = item.partition("=")
+                if not sep:
+                    raise ValueError("unit must be unit_key=variable_value")
+                units.append(dict(unit_key=key, variable_value=value))
+            result = {"id": create_experiment(conn, cfg, args.project, args.key, args.variable,
+                                             args.hypothesis, units, now)}
+        elif args.action == "attach":
+            attach_experiment_post(conn, cfg, args.id, args.unit, args.post_id, now)
+            result = {"id": args.id, "units": experiment_units_summary(conn, args.id)}
+        elif args.action == "evaluate":
+            result = evaluate_experiment(conn, cfg, args.id, now)
+        else:
+            result = [{**row, "units": experiment_units_summary(conn, row["id"])}
+                      for row in list_experiments(conn, args.project, args.status)]
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except ValueError as exc:
+        print(f"experiments error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+
+def cmd_rules(args) -> int:
+    cfg = load_config(args.config)
+    conn = db_connect(cfg)
+    now = now_kst()
+    try:
+        if args.project:
+            pick_projects(cfg, [args.project])
+        if args.action == "list":
+            result = {p.name: active_rules(conn, p.name) for p in cfg["_projects"]
+                      if not args.project or p.name == args.project}
+        elif args.action == "promote":
+            result = {"id": promote_rule(conn, cfg, args.project, args.key, args.value, now,
+                                        {"experiment_id": args.experiment,
+                                         "confirm_experiment_id": args.confirm_experiment})}
+        elif args.action == "check":
+            result = check_rule_regression(conn, cfg, args.project, args.key, now)
+        else:
+            result = rollback_rule(conn, cfg, args.project, args.key, now, args.reason)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except ValueError as exc:
+        print(f"rules error: {exc}", file=sys.stderr)
         return 2
     finally:
         conn.close()
@@ -3721,6 +4221,41 @@ def build_parser() -> argparse.ArgumentParser:
     recording.add_argument("--observed-at", help="ISO datetime (default: now)")
     recording.add_argument("--window", help="e.g. 48h, 7d, lifetime")
     recording.add_argument("--note")
+
+    experiments = sub.add_parser("experiments", help="local single-variable comparisons")
+    experiments.set_defaults(func=cmd_experiments)
+    actions = experiments.add_subparsers(dest="action", required=True)
+    creating = actions.add_parser("create")
+    creating.add_argument("--project", required=True)
+    creating.add_argument("--key", required=True)
+    creating.add_argument("--variable", required=True)
+    creating.add_argument("--hypothesis", required=True)
+    creating.add_argument("--unit", action="append", required=True, help="unit_key=variable_value (repeatable)")
+    attaching = actions.add_parser("attach")
+    attaching.add_argument("--id", type=int, required=True)
+    attaching.add_argument("--unit", required=True)
+    attaching.add_argument("--post-id", required=True)
+    evaluating = actions.add_parser("evaluate")
+    evaluating.add_argument("--id", type=int, required=True)
+    listing = actions.add_parser("list")
+    listing.add_argument("--project")
+    listing.add_argument("--status", choices=("running", "concluded"))
+
+    rules = sub.add_parser("rules", help="brand operating rules backed by experiment evidence")
+    rules.set_defaults(func=cmd_rules)
+    actions = rules.add_subparsers(dest="action", required=True)
+    listing = actions.add_parser("list")
+    listing.add_argument("--project")
+    for action in ("promote", "check", "rollback"):
+        action_parser = actions.add_parser(action)
+        action_parser.add_argument("--project", required=True)
+        action_parser.add_argument("--key", required=True)
+        if action == "promote":
+            action_parser.add_argument("--value", required=True)
+            action_parser.add_argument("--experiment", type=int, required=True)
+            action_parser.add_argument("--confirm-experiment", type=int)
+        elif action == "rollback":
+            action_parser.add_argument("--reason", required=True)
 
     dm = sub.add_parser("daemon", help="7-stage dev & blueprint-audit daemon (start/stop/restart/status/stages)")
     dm.add_argument("action", nargs="?", default="status",

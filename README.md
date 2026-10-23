@@ -186,6 +186,49 @@ score·댓글 수는 1층으로 연결하지만 HTTP 상태 코드만 얻은 경
 값을 고유 이용자·매출 총계로 해석하면 안 됩니다. 상태 표 아래에는 층별 관측 개수와 미식별
 개수를 표시합니다.
 
+## 작은 실험과 운영 규칙 (Batch 4)
+
+브랜드·변수별로 진행 중인 실험은 하나이며, 기본 기간은 14일, 단위 수는 최대 6개입니다.
+각 단위의 값은 서로 달라야 합니다. `hook_type`은 기존 3종만 허용하므로 최대 3개 단위로
+비교합니다. 나머지 변수는 `channel`, `landing_page`, `posting_window`입니다.
+`posting_window` 값은 KST 0/6/12/18시 기준 `dawn`/`morning`/`afternoon`/`evening`입니다.
+`leader`는 결과 JSON에서 사용하는 예약 단위 키입니다.
+
+```sh
+python3 autobot.py experiments create --project hanset --key hooks-01 --variable hook_type --hypothesis '발견 훅의 가입률이 높을 것이다' --unit control=loss_prevention --unit variant=discovery
+python3 autobot.py experiments attach --id 1 --unit control --post-id p_CONTROL
+python3 autobot.py experiments attach --id 1 --unit variant --post-id p_VARIANT
+python3 autobot.py experiments list --project hanset --status running
+python3 autobot.py experiments evaluate --id 1
+python3 autobot.py rules promote --project hanset --key hook_type --value discovery --experiment 1
+python3 autobot.py rules list --project hanset
+python3 autobot.py rules check --project hanset --key hook_type
+python3 autobot.py rules rollback --project hanset --key hook_type --reason '후속 성과 악화 확인'
+```
+
+게시 확인된 같은 브랜드의 게시물만 연결하며 게시 시각은 실험 기간 안이어야 합니다.
+테스트 변수 이외의 훅·채널·정규화한 도착 URL·게시 시간대는 모두 확인되고 같아야 합니다.
+기간 종료 후 모든 단위의 7d 자료 열람 분모가 기본 30 이상이어야 가입률로 비교합니다.
+가입률 동률은 CTR로 비교하고, 그래도 동률이거나 지표가 누락되면 `판정 보류`입니다.
+종료된 실험 결과는 고정됩니다. 새 검증은 새 실험으로 등록합니다.
+
+`run`의 metrics 단계와 `status`는 완료된 48h/7d 검사에 대해 5분류 진단을 DB에 저장합니다.
+`run --no-metrics`는 진단도 건너뜁니다. 진단은 노출 → 클릭 → 열람 → 가입 → 재방문 순서로
+첫 실패 또는 표본 부족을 기록하며, 예상·실제 수치와 분모·가능한 다른 원인·다음 한 가지
+변경을 남깁니다. 정상 게시물은 `pass`, 표본 부족이나 미측정은 `판정 보류`입니다.
+같은 기간·지표의 최신 비어 있지 않은 스냅샷만 읽으며 기간이 없거나 `48h`/`7d`가 아닌
+관측은 제외합니다. 상태 보고서에 진단별 개수와 제외한 관측 개수를 표시합니다.
+
+규칙 승격에는 48h와 7d의 충분한 표본에서 같은 승자가 나와야 합니다. 또는
+`--confirm-experiment ID`로 같은 브랜드·변수·승리 값을 가진 별도 종료 실험을 지정합니다.
+근거는 DB에서 검증하며 보류 결과는 승격할 수 없습니다. 승격 시 이전 버전은 보존합니다.
+이후 해당 값을 사용하고 승격 이후 게시 확인된 게시물의 7d 가입률을 합산해 점검하며,
+최소 표본에서 기준 가입률보다 기본 20% 넘게 악화하면 자동 롤백합니다. 가입 수나 자료
+열람 수가 미확인인 게시물은 이 합산에서 제외합니다. 과거 버전이 없으면 활성 규칙을
+제거합니다. DB가 원본이며 `paths.rules`(기본 `data/rules.json`)는 임시 파일과 rename으로
+갱신하는 브랜드별 JSON 사본입니다. `write_rules`로 DB에서 사본을 다시 생성할 수 있습니다.
+설정은 `experiments`, `diagnosis`, `rules`에서 기간·상한·최소 표본·비율 기준을 조절합니다.
+
 ## 운영 규칙과 cron
 
 공개 접근만 사용하고 robots.txt, 요청 간격, 사이트별 상한을 지킵니다. 개인정보·유료 API·
