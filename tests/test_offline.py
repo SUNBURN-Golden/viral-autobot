@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,7 +39,8 @@ def check(name, condition, detail=""):
 
 
 # ---------------------------------------------------------------- helpers
-def make_cfg(tmp_dir, base_url=None, rounds_text=None, **over):
+def make_cfg(tmp_dir, base_url=None, rounds_text=None, no_url=(), **over):
+    os.makedirs(tmp_dir, exist_ok=True)
     cfg = ab.load_config(os.path.join(ROOT, "config.json"))
     cfg["paths"]["db"] = os.path.join(tmp_dir, "autobot.db")
     cfg["paths"]["logs"] = os.path.join(tmp_dir, "logs")
@@ -60,6 +61,10 @@ def make_cfg(tmp_dir, base_url=None, rounds_text=None, **over):
             if proj.name == "hanset":
                 proj.url = base_url
                 proj.domains = [urllib.parse.urlsplit(base_url).netloc]
+    for proj in cfg["_projects"]:
+        if proj.name in no_url:
+            proj.url = None
+            proj.domains = []
     return cfg
 
 
@@ -252,6 +257,10 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         if path == "/slow-robots.txt":
             time.sleep(0.2)
+        if path == "/gone-410":
+            self.send_response(410)
+            self.end_headers()
+            return
         entry = PAGES.get(path)
         if entry is None:
             self.send_response(404)
@@ -441,7 +450,7 @@ def test_discovery_reddit_store(tmp_dir):
 
 
 def test_status(tmp_dir, server):
-    cfg = make_cfg(tmp_dir, rounds_text=ROUNDS)
+    cfg = make_cfg(tmp_dir, rounds_text=ROUNDS, no_url=("agamajung",))
     conn = ab.db_connect(cfg)
     ab.process_rounds_log(conn, cfg, ab.now_kst())
     # make every due check local: one 404, one dead port, one url-less entry
@@ -522,6 +531,9 @@ def test_env_and_slack(tmp_dir):
         return StubResponse()
 
     try:
+        # Exercise the missing-webhook branch without making an external request.
+        with open(env_path, "w", encoding="utf-8") as fh:
+            fh.write("OTHER=x\n")
         check("slack: missing webhook -> skipped",
               ab.post_slack(cfg, "hello") is False, "")
         with open(env_path, "w", encoding="utf-8") as fh:
@@ -683,9 +695,350 @@ def test_daemon_stages_and_fallback(tmp_dir):
           and not dm.should_run_audit(9, 0) and not dm.should_run_audit(10, 10), "")
 
 
+def test_config_batch1(tmp_dir):
+    cfg = make_cfg(tmp_dir)
+    projects = {p.name: p for p in cfg["_projects"]}
+    baby, lit = projects["agamajung"], projects["goallit"]
+    check("config: agamajung public URL", baby.url == "https://agamajoong.soulbound.co.kr")
+    check("config: agamajoong domain alias", "agamajoong.soulbound.co.kr" in baby.domains)
+    check("config: no stale blocker note", "blocker_note" not in baby.raw)
+    check("config: both baby romanizations", {"agamajung", "agamajoong"} <= set(baby.names))
+    check("config: primary Korean spelling", lit.tagline_ko.startswith("꼴릿") and "골릿" not in lit.tagline_ko)
+    check("config: old Korean alias retained", lit.names.index("꼴릿") < lit.names.index("골릿"))
+    check("config: reliability limits", all(cfg["limits"][key] == value for key, value in
+          (("metric_max_attempts", 3), ("metric_retry_minutes", 60), ("max_reverify_per_site", 10))))
+    check("config: domain maps to stable project key", ab.map_project(
+        "see https://agamajoong.soulbound.co.kr/x", "https://agamajoong.soulbound.co.kr/x",
+        cfg["_projects"])[0] == "agamajung")
+    # Defaults also apply to configurations written before Batch 1.
+    raw = json.loads(json.dumps({k: v for k, v in cfg.items() if k != "_projects"}))
+    for key in ("metric_max_attempts", "metric_retry_minutes", "max_reverify_per_site"):
+        raw["limits"].pop(key)
+    path = os.path.join(tmp_dir, "old-config.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(raw, fh)
+    loaded = ab.load_config(path)
+    check("config: missing limits get defaults", all(loaded["limits"][key] == cfg["limits"][key]
+          for key in ("metric_max_attempts", "metric_retry_minutes", "max_reverify_per_site")))
+    conn = ab.db_connect(cfg)
+    ab.ensure_config_blockers(conn, cfg)
+    check("config: actual URLs have no missing-URL blocker", not conn.execute(
+        "SELECT 1 FROM blockers WHERE code='NO_PUBLIC_URL' AND active=1").fetchall())
+    ab.ensure_config_blockers(conn, make_cfg(tmp_dir, no_url=("agamajung",)))
+    check("config: explicit null URL still blocked", conn.execute(
+        "SELECT active FROM blockers WHERE project='agamajung' AND code='NO_PUBLIC_URL'"
+    ).fetchone()["active"] == 1)
+    conn.close()
+
+
+def test_metric_retry(tmp_dir):
+    cfg = make_cfg(tmp_dir)
+    conn = ab.db_connect(cfg)
+    now = ab.kst(datetime(2026, 10, 23, 12))
+    post_id = ab.record_post(conn, "hanset", "threads", "https://example.test/landing", "retry", now)
+    ab.mark_published_verified(conn, post_id, "https://example.test/post", now - timedelta(days=8), now)
+
+    class StubFetcher:
+        success = False
+        requests = 0
+
+        def get(self, url, **kwargs):
+            self.requests += 1
+            return ab.FetchResult(url, 200 if self.success else None, b"ok", None,
+                                  None if self.success else "timeout", 0.0)
+
+    fetcher = StubFetcher()
+    ab.run_due_checks(conn, fetcher, cfg, now)
+    rows = conn.execute("SELECT * FROM metric_checks").fetchall()
+    check("retry: first failure remains pending", all(r["status"] == "pending" and r["attempts"] == 1 for r in rows))
+    check("retry: first backoff is 60 minutes", all(r["retry_at"] == ab.iso(now + timedelta(hours=1)) for r in rows))
+    check("retry: checked_at uses supplied clock", all(r["checked_at"] == ab.iso(now) for r in rows))
+    ab.run_due_checks(conn, fetcher, cfg, now + timedelta(minutes=59))
+    check("retry: no request before retry_at", fetcher.requests == 2)
+    ab.run_due_checks(conn, fetcher, cfg, now + timedelta(hours=1))
+    rows = conn.execute("SELECT * FROM metric_checks").fetchall()
+    check("retry: second failure still pending", all(r["status"] == "pending" and r["attempts"] == 2 for r in rows))
+    check("retry: second backoff is 120 minutes", all(r["retry_at"] == ab.iso(now + timedelta(hours=3)) for r in rows))
+    ab.run_due_checks(conn, fetcher, cfg, now + timedelta(hours=3))
+    rows = conn.execute("SELECT * FROM metric_checks").fetchall()
+    check("retry: third failure is failed, never done", all(
+        r["status"] == "failed" and r["attempts"] == 3 and r["failure_reason"] and r["retry_at"] is None for r in rows))
+    ab.run_due_checks(conn, fetcher, cfg, now + timedelta(days=10))
+    check("retry: failed checks are terminal", fetcher.requests == 6)
+    check("retry: status distinguishes failed checks", ab.collect_status(conn, cfg, now)["failed_checks"] == 2
+          and "failed 2" in ab._metrics_cell(conn, "hanset") and "48h 0/1" in ab._metrics_cell(conn, "hanset"))
+
+    recovered = ab.record_post(conn, "hanset", "x", "https://example.test/recover", "recover", now)
+    ab.mark_published_verified(conn, recovered, "https://example.test/recovered", now - timedelta(days=3), now)
+    ab.run_due_checks(conn, fetcher, cfg, now)
+    fetcher.success = True
+    ab.run_due_checks(conn, fetcher, cfg, now + timedelta(hours=1))
+    row = conn.execute("SELECT mc.* FROM metric_checks mc JOIN published p ON p.id=mc.published_id "
+                       "WHERE p.post_id=? AND check_kind='48h'", (recovered,)).fetchone()
+    check("retry: success after failure clears retry and reason", row["status"] == "done" and row["attempts"] == 2
+          and row["retry_at"] is None and row["failure_reason"] is None)
+    conn.execute("UPDATE metric_checks SET status='error' WHERE id=?", (rows[0]["id"],))
+    conn.execute("UPDATE metric_checks SET status='done', result=? WHERE id=?",
+                 (json.dumps({"checked": False, "reason": "old timeout"}), rows[1]["id"]))
+    conn.commit()
+    conn.close()
+    conn = ab.db_connect(cfg)
+    migrated = {r["id"]: r for r in conn.execute("SELECT * FROM metric_checks")}
+    check("migration: old error is retryable", migrated[rows[0]["id"]]["status"] == "pending")
+    check("migration: false done becomes failed", migrated[rows[1]["id"]]["status"] == "failed"
+          and migrated[rows[1]["id"]]["failure_reason"] == "old timeout")
+    check("migration: true done remains done", conn.execute(
+        "SELECT status FROM metric_checks WHERE id=?", (row["id"],)).fetchone()["status"] == "done")
+    conn.close()
+
+
+def seed_page(conn, url, now, state="candidate", valid_until=None, digest="stored"):
+    """A stored page with a linked draft; all URLs are local or stubbed."""
+    conn.execute("INSERT INTO pages (project, url, first_seen, last_seen, content_hash, valid_until) "
+                 "VALUES ('hanset', ?, ?, ?, ?, ?)", (url, ab.iso(now), ab.iso(now), digest, valid_until))
+    cur = conn.execute("INSERT INTO drafts (project, page_url, path, channels, created, state) "
+                       "VALUES ('hanset', ?, 'unused.md', 'threads', ?, ?)", (url, ab.iso(now), state))
+    conn.commit()
+    return cur.lastrowid
+
+
+def test_page_reverify(tmp_dir, server):
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    Handler.base = base
+    cfg = make_cfg(tmp_dir, base_url=base)
+    conn = ab.db_connect(cfg)
+    proj = cfg["_projects"][0]
+    now = ab.kst(datetime(2026, 10, 23, 12))
+    for path in ("/gone", "/gone-410"):
+        url = base + path
+        seed_page(conn, url, now)
+        ab.record_post(conn, "hanset", "threads", url, path, now)
+    verified = ab.record_post(conn, "hanset", "x", base + "/gone", "already live", now)
+    ab.mark_published_verified(conn, verified, base + "/external-post", now, now)
+    result = ab.reverify_pages(conn, ab.Fetcher(cfg), proj, cfg, now)
+    check("reverify: 404 and 410 detected", result == {"checked": 2, "gone": 2, "expired": 0, "held": 4}, str(result))
+    pages = {r["url"]: r for r in conn.execute("SELECT * FROM pages")}
+    check("reverify: HTTP status and verification time recorded", all(
+        pages[base + path]["http_status"] == code and pages[base + path]["last_status"] == "gone"
+        and pages[base + path]["last_verified"] == ab.iso(now) for path, code in (("/gone", 404), ("/gone-410", 410))))
+    check("reverify: drafts held with reasons", all(r["state"] == "expired_hold" and r["hold_reason"]
+          for r in conn.execute("SELECT * FROM drafts")))
+    check("reverify: scheduled posts held", conn.execute(
+        "SELECT COUNT(*) AS n FROM published WHERE state='expired_hold'").fetchone()["n"] == 2)
+    check("reverify: live post preserved", conn.execute("SELECT state FROM published WHERE post_id=?",
+          (verified,)).fetchone()["state"] == "published_verified")
+    check("reverify: state changes audited", conn.execute("SELECT COUNT(*) AS n FROM post_events "
+          "WHERE to_state='expired_hold'").fetchone()["n"] == 4)
+    check("reverify: blocker active", conn.execute("SELECT active FROM blockers WHERE code='PAGES_GONE'").fetchone()["active"] == 1)
+    again = ab.reverify_pages(conn, ab.Fetcher(cfg), proj, cfg, now)
+    check("reverify: repeated check makes no changes", again == {"checked": 0, "gone": 0, "expired": 0, "held": 0})
+    check("reverify: repeated hold adds no events", conn.execute("SELECT COUNT(*) AS n FROM post_events "
+          "WHERE to_state='expired_hold'").fetchone()["n"] == 4)
+
+    url = base + "/deadline"
+    seed_page(conn, url, now, valid_until=ab.iso(now - timedelta(seconds=1)))
+    ab.record_post(conn, "hanset", "threads", url, "deadline", now)
+    fetcher = ab.Fetcher(cfg)
+    result = ab.reverify_pages(conn, fetcher, proj, cfg, now)
+    check("reverify: expiry needs no HTTP requests", result == {"checked": 0, "gone": 0, "expired": 1, "held": 2}
+          and fetcher.requests == 0, str(result))
+    check("reverify: expired status saved", conn.execute("SELECT last_status FROM pages WHERE url=?", (url,)).fetchone()["last_status"] == "expired")
+    # A cached URL still in the sitemap stays dead after the crawl's status reset.
+    seed_page(conn, base + "/guides/saunas", now)
+    ab._mark_page_dead(conn, "hanset", base + "/guides/saunas", "gone", 404, now)
+    ab.crawl_project(conn, ab.Fetcher(cfg), proj, cfg, now)
+    check("crawl: preserves gone and expired", all(conn.execute(
+        "SELECT last_status FROM pages WHERE url=?", (u,)).fetchone()["last_status"] == status
+        for u, status in ((base + "/gone", "gone"), (url, "expired"), (base + "/guides/saunas", "gone"))))
+    check("crawl: PAGES_GONE survives blocker cleanup", conn.execute(
+        "SELECT active FROM blockers WHERE code='PAGES_GONE'").fetchone()["active"] == 1)
+    # Force a first content fetch from a sitemap URL to hit 404.
+    sitemap = PAGES["/posts-sitemap.xml"]
+    try:
+        PAGES["/posts-sitemap.xml"] = ("application/xml", "<urlset><url><loc>{base}/fresh-gone</loc></url></urlset>")
+        ab.crawl_project(conn, ab.Fetcher(cfg), proj, cfg, now)
+    finally:
+        PAGES["/posts-sitemap.xml"] = sitemap
+    check("crawl: new 404 page saved as gone", conn.execute(
+        "SELECT last_status, http_status FROM pages WHERE url=?", (base + "/fresh-gone",)).fetchone()["last_status"] == "gone")
+    check("crawl: permanent removal is not FETCH_ERRORS", not conn.execute(
+        "SELECT 1 FROM blockers WHERE code='FETCH_ERRORS' AND active=1").fetchall())
+    conn.close()
+
+    # Cap, order, robots and transient errors without even local HTTP requests.
+    cfg = make_cfg(os.path.join(tmp_dir, "bounded"), base_url=base, max_reverify_per_site=1)
+    conn = ab.db_connect(cfg)
+    for path in ("/private/old", "/old", "/recent"):
+        seed_page(conn, base + path, now)
+    conn.execute("UPDATE pages SET last_verified=? WHERE url=?", (ab.iso(now), base + "/recent"))
+    conn.commit()
+
+    class StubFetcher:
+        requested = []
+        success = False
+
+        def can_fetch(self, url):
+            return "/private/" not in url
+
+        def get(self, url, **kwargs):
+            self.requested.append((url, kwargs.get("max_bytes")))
+            return ab.FetchResult(url, 200 if self.success else None, b"ok", None, "timeout", 0)
+
+    fetcher = StubFetcher()
+    result = ab.reverify_pages(conn, fetcher, cfg["_projects"][0], cfg, now)
+    check("reverify: oldest first, cap and robots respected", fetcher.requested == [(base + "/old", 4096)])
+    row = conn.execute("SELECT * FROM pages WHERE url=?", (base + "/old",)).fetchone()
+    check("reverify: timeout leaves verification unknown", row["last_status"] == "new" and row["last_verified"] is None
+          and row["http_status"] is None and result["gone"] == 0)
+    fetcher.success = True
+    ab.reverify_pages(conn, fetcher, cfg["_projects"][0], cfg, now)
+    row = conn.execute("SELECT * FROM pages WHERE url=?", (base + "/old",)).fetchone()
+    check("reverify: success updates only HTTP metadata", row["last_status"] == "new" and row["http_status"] == 200
+          and row["last_verified"] == ab.iso(now))
+    conn.close()
+
+
+def test_post_id_state_machine(tmp_dir):
+    cfg = make_cfg(tmp_dir, rounds_text=ROUNDS)
+    conn = ab.db_connect(cfg)
+    now = ab.kst(datetime(2026, 10, 23, 12))
+    url = "https://example.test/landing"
+    first_id = ab.make_post_id("hanset", "threads", url)
+    check("post_id: deterministic and fragment-independent", first_id == ab.make_post_id("hanset", "threads", url + "#frag")
+          and first_id.startswith("p_") and len(first_id) == 18)
+    check("post_id: channel and project isolated", first_id != ab.make_post_id("hanset", "x", url)
+          and first_id != ab.make_post_id("goallit", "threads", url))
+    check("post_id: normalized label fallback", ab.make_post_id(None, None, label=" Hello ") == ab.make_post_id("", "", label="hello"))
+    post_id = ab.record_post(conn, "hanset", "threads", url, "test", now)
+    repeated = ab.record_post(conn, "hanset", "threads", url + "#frag", "changed label", now + timedelta(hours=1))
+    check("post_id: repeated record inserts one row", post_id == repeated and conn.execute(
+        "SELECT COUNT(*) AS n FROM published").fetchone()["n"] == 1)
+    ab._queue_metric_checks(conn, now)
+    check("metrics: scheduled post has no checks", not conn.execute("SELECT * FROM metric_checks").fetchall())
+    conn.close()
+    conn = ab.db_connect(cfg)
+    row = conn.execute("SELECT * FROM published WHERE post_id=?", (post_id,)).fetchone()
+    check("migration: scheduled post stays unverified on reopen", row["verified_at"] is None and row["url"] is None)
+    check("state: all forward steps allowed", all(ab.can_transition(a, b) for a, b in zip(ab.POST_FLOW, ab.POST_FLOW[1:])))
+    check("state: holds allowed only before publication", all(ab.can_transition(a, b) for a in ab.PRE_PUBLISH for b in ab.HOLD_STATES)
+          and all(ab.can_transition(a, "candidate") for a in ab.HOLD_STATES)
+          and not ab.can_transition("published_verified", "expired_hold"))
+    check("state: skips, backwards and terminal moves denied", not ab.can_transition("candidate", "published_verified")
+          and not ab.can_transition("scheduled", "approved") and not any(ab.can_transition("evaluated", b) for b in ab.POST_FLOW + ab.HOLD_STATES)
+          and not ab.can_transition("invalid", "candidate"))
+    try:
+        ab.transition(conn, "post", row["id"], "evaluated", now)
+        rejected = False
+    except ValueError:
+        rejected = True
+    check("state: invalid transition raises and preserves row", rejected and conn.execute(
+        "SELECT state FROM published WHERE post_id=?", (post_id,)).fetchone()["state"] == "scheduled")
+    verified_at = now + timedelta(days=2)
+    ab.mark_published_verified(conn, post_id, "https://example.test/public-post", verified_at, verified_at)
+    checks = {r["check_kind"]: r["due_at"] for r in conn.execute("SELECT * FROM metric_checks")}
+    check("metrics: due dates start at verification", checks == {"48h": ab.iso(verified_at + timedelta(hours=48)),
+          "7d": ab.iso(verified_at + timedelta(days=7))}, str(checks))
+    ab.mark_published_verified(conn, post_id, "https://example.test/public-post#frag", verified_at + timedelta(days=1), verified_at)
+    check("metrics: repeated verification preserves clock", conn.execute("SELECT verified_at FROM published WHERE post_id=?",
+          (post_id,)).fetchone()["verified_at"] == ab.iso(verified_at) and conn.execute(
+          "SELECT COUNT(*) AS n FROM metric_checks").fetchone()["n"] == 2)
+    ab.transition(conn, "post", row["id"], "measured", now)
+    ab.transition(conn, "post", row["id"], "evaluated", now)
+    before = conn.execute("SELECT COUNT(*) AS n FROM post_events").fetchone()["n"]
+    ab.transition(conn, "post", row["id"], "evaluated", now)
+    check("state: same state creates no duplicate event", before == 3 and conn.execute(
+        "SELECT COUNT(*) AS n FROM post_events").fetchone()["n"] == before)
+    draft_id = seed_page(conn, url, now)
+    ab.transition(conn, "draft", draft_id, "needs_research", now, "missing evidence")
+    ab.transition(conn, "draft", draft_id, "candidate", now)
+    check("state: hold can restart at candidate", conn.execute("SELECT hold_reason FROM drafts WHERE id=?",
+          (draft_id,)).fetchone()["hold_reason"] is None)
+    # Failure inserting the event must roll the state update back too.
+    conn.execute("CREATE TEMP TRIGGER reject_event BEFORE INSERT ON post_events "
+                 "BEGIN SELECT RAISE(ABORT, 'event rejected'); END")
+    try:
+        ab.transition(conn, "draft", draft_id, "fact_checked", now)
+        rejected = False
+    except sqlite3.IntegrityError:
+        rejected = True
+    conn.execute("DROP TRIGGER reject_event")
+    check("state: update and event are atomic", rejected and conn.execute(
+        "SELECT state FROM drafts WHERE id=?", (draft_id,)).fetchone()["state"] == "candidate")
+    conn.close()
+
+    cfg = make_cfg(os.path.join(tmp_dir, "rounds"), rounds_text=ROUNDS)
+    os.makedirs(os.path.dirname(cfg["paths"]["rounds_log"]), exist_ok=True)
+    conn = ab.db_connect(cfg)
+    ab.process_rounds_log(conn, cfg, now)
+    with open(cfg["paths"]["rounds_log"], "w", encoding="utf-8") as fh:
+        fh.write("an inserted heading\n" + ROUNDS)
+    check("post_id: line insertion adds no duplicates", ab.process_rounds_log(conn, cfg, now) == 0
+          and conn.execute("SELECT COUNT(*) AS n FROM published").fetchone()["n"] == 3)
+    # One historical duplicate and one unfilled id that collides with an existing id.
+    old = conn.execute("SELECT * FROM published WHERE url IS NOT NULL ORDER BY id LIMIT 1").fetchone()
+    conn.execute("INSERT INTO published (project, url, kind, published_at, first_seen) VALUES (?, ?, ?, ?, ?)",
+                 (old["project"], old["url"], old["kind"], old["published_at"], old["first_seen"]))
+    conn.commit()
+    conn.close()
+    conn = ab.db_connect(cfg)
+    check("migration: collision preserves legacy row without id", conn.execute(
+        "SELECT COUNT(*) AS n FROM published WHERE post_id IS NULL").fetchone()["n"] == 1)
+    conn.close()
+
+    # Upgrade real pre-Batch-1 tables, rather than only exercising a fresh schema.
+    cfg = make_cfg(os.path.join(tmp_dir, "legacy"))
+    os.makedirs(os.path.dirname(cfg["paths"]["db"]), exist_ok=True)
+    conn = sqlite3.connect(cfg["paths"]["db"])
+    conn.executescript("""
+        CREATE TABLE pages (id INTEGER PRIMARY KEY, project TEXT, url TEXT,
+            first_seen TEXT, last_seen TEXT, lastmod TEXT, content_hash TEXT, title TEXT,
+            description TEXT, last_status TEXT DEFAULT 'new', last_changed TEXT,
+            fetch_count INTEGER DEFAULT 0, UNIQUE(project,url));
+        CREATE TABLE drafts (id INTEGER PRIMARY KEY, project TEXT, page_url TEXT, path TEXT,
+            channels TEXT, page_status TEXT, created TEXT, UNIQUE(project,page_url));
+        CREATE TABLE published (id INTEGER PRIMARY KEY, project TEXT, url TEXT, label TEXT,
+            kind TEXT, published_at TEXT, source TEXT DEFAULT 'rounds.log', line_no INTEGER,
+            raw_line TEXT, mapping TEXT, due_hint_48h TEXT, due_hint_7d TEXT,
+            dedupe_key TEXT UNIQUE, first_seen TEXT);
+        CREATE TABLE metric_checks (id INTEGER PRIMARY KEY, published_id INTEGER,
+            check_kind TEXT, due_at TEXT, status TEXT DEFAULT 'pending', attempts INTEGER DEFAULT 0,
+            checked_at TEXT, result TEXT, UNIQUE(published_id,check_kind));
+        INSERT INTO pages(project,url,first_seen,last_seen) VALUES ('hanset','https://example.test/a','old','old');
+        INSERT INTO drafts(project,page_url,path,channels,created) VALUES ('hanset','https://example.test/a','a.md','x','old');
+        INSERT INTO published(project,url,kind,published_at,first_seen)
+            VALUES ('hanset','https://example.test/old-post','web','2026-10-01T12:00:00+09:00','old');
+        INSERT INTO published(project,url,kind,published_at,first_seen)
+            VALUES ('hanset','https://example.test/old-post','web','2026-10-01T12:00:00+09:00','old');
+    """)
+    conn.close()
+    conn = ab.db_connect(cfg)
+    check("migration: old columns added", {"http_status", "last_verified", "valid_until"} <=
+          {r["name"] for r in conn.execute("PRAGMA table_info(pages)")} and conn.execute(
+          "SELECT state FROM drafts").fetchone()["state"] == "candidate")
+    old = conn.execute("SELECT * FROM published ORDER BY id LIMIT 1").fetchone()
+    check("migration: legacy post clock and identity backfilled", old["verified_at"] == old["published_at"]
+          and old["channel"] == "web" and old["state"] == "published_verified" and old["post_id"])
+    check("migration: duplicate historical identity handled", conn.execute(
+        "SELECT COUNT(*) AS n FROM published WHERE post_id IS NULL").fetchone()["n"] == 1)
+    conn.close()
+    conn = ab.db_connect(cfg)
+    check("migration: repeated upgrade preserves data", conn.execute("SELECT COUNT(*) AS n FROM published").fetchone()["n"] == 2)
+    conn.close()
+
+
 def main():
     import tempfile
     print("offline tests for autobot.py")
+    real_urlopen = urllib.request.urlopen
+
+    def local_urlopen(request, *args, **kwargs):
+        url = request.full_url if isinstance(request, urllib.request.Request) else request
+        if urllib.parse.urlsplit(url).hostname not in ("127.0.0.1", "localhost", "::1"):
+            check("offline: external HTTP request forbidden", False)
+            raise AssertionError("offline tests permit loopback HTTP only")
+        return real_urlopen(request, *args, **kwargs)
+
+    urllib.request.urlopen = local_urlopen
     server = start_server()
     try:
         test_utm()
@@ -703,8 +1056,13 @@ def main():
         test_status_write(tempfile.mkdtemp(prefix="ab-write-"))
         test_env_and_slack(tempfile.mkdtemp(prefix="ab-env-"))
         test_daemon_stages_and_fallback(tempfile.mkdtemp(prefix="ab-daemon-"))
+        test_config_batch1(tempfile.mkdtemp(prefix="ab-config-"))
+        test_metric_retry(tempfile.mkdtemp(prefix="ab-retry-"))
+        test_page_reverify(tempfile.mkdtemp(prefix="ab-reverify-"), server)
+        test_post_id_state_machine(tempfile.mkdtemp(prefix="ab-state-"))
     finally:
         server.shutdown()
+        urllib.request.urlopen = real_urlopen
     print(f"\n{len(PASSES)} passed, {len(FAILURES)} failed")
     for failure in FAILURES:
         print("  -", failure)

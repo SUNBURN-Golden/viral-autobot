@@ -160,6 +160,9 @@ def load_config(path: str) -> dict:
     limits.setdefault("reddit_min_sleep", 6.0)
     limits.setdefault("max_reddit_requests_per_run", 40)
     limits.setdefault("max_metric_checks_per_run", 40)
+    limits.setdefault("metric_max_attempts", 3)
+    limits.setdefault("metric_retry_minutes", 60)
+    limits.setdefault("max_reverify_per_site", 10)
     paths = cfg.setdefault("paths", {})
     paths.setdefault("db", "data/autobot.db")
     paths.setdefault("logs", "logs")
@@ -222,6 +225,9 @@ CREATE TABLE IF NOT EXISTS pages (
   last_status TEXT NOT NULL DEFAULT 'new',
   last_changed TEXT,
   fetch_count INTEGER NOT NULL DEFAULT 0,
+  http_status INTEGER,
+  last_verified TEXT,
+  valid_until TEXT,
   UNIQUE (project, url)
 );
 CREATE INDEX IF NOT EXISTS idx_pages_proj_status ON pages (project, last_status);
@@ -264,6 +270,8 @@ CREATE TABLE IF NOT EXISTS drafts (
   channels TEXT NOT NULL,
   page_status TEXT,
   created TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'candidate',
+  hold_reason TEXT,
   UNIQUE (project, page_url)
 );
 CREATE TABLE IF NOT EXISTS published (
@@ -280,7 +288,13 @@ CREATE TABLE IF NOT EXISTS published (
   due_hint_48h TEXT,
   due_hint_7d TEXT,
   dedupe_key TEXT UNIQUE,
-  first_seen TEXT NOT NULL
+  first_seen TEXT NOT NULL,
+  post_id TEXT,
+  channel TEXT,
+  target_url TEXT,
+  state TEXT NOT NULL DEFAULT 'published_verified',
+  verified_at TEXT,
+  hold_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pub_proj ON published (project);
 CREATE TABLE IF NOT EXISTS metric_checks (
@@ -292,9 +306,21 @@ CREATE TABLE IF NOT EXISTS metric_checks (
   attempts INTEGER NOT NULL DEFAULT 0,
   checked_at TEXT,
   result TEXT,
+  retry_at TEXT,
+  failure_reason TEXT,
   UNIQUE (published_id, check_kind)
 );
 CREATE INDEX IF NOT EXISTS idx_checks_due ON metric_checks (status, due_at);
+CREATE TABLE IF NOT EXISTS post_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  post_id TEXT,
+  entity TEXT NOT NULL CHECK (entity IN ('draft', 'post')),
+  entity_id INTEGER NOT NULL,
+  from_state TEXT,
+  to_state TEXT NOT NULL,
+  at TEXT NOT NULL,
+  reason TEXT
+);
 CREATE TABLE IF NOT EXISTS blockers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project TEXT NOT NULL,
@@ -317,8 +343,53 @@ def db_connect(cfg: dict) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Upgrade existing ledgers in place; safe to repeat on every connection."""
+    additions = {
+        "pages": {"http_status": "INTEGER", "last_verified": "TEXT", "valid_until": "TEXT"},
+        "drafts": {"state": "TEXT NOT NULL DEFAULT 'candidate'", "hold_reason": "TEXT"},
+        "published": {"post_id": "TEXT", "channel": "TEXT", "target_url": "TEXT",
+                      "state": "TEXT NOT NULL DEFAULT 'published_verified'",
+                      "verified_at": "TEXT", "hold_reason": "TEXT"},
+        "metric_checks": {"retry_at": "TEXT", "failure_reason": "TEXT"},
+    }
+    with conn:
+        for table, columns in additions.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, declaration in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        conn.execute("UPDATE published SET channel=kind WHERE channel IS NULL")
+        conn.execute("UPDATE published SET verified_at=published_at WHERE verified_at IS NULL "
+                     "AND state IN ('published_verified','measured','evaluated')")
+        used = {r["post_id"] for r in conn.execute(
+            "SELECT post_id FROM published WHERE post_id IS NOT NULL")}
+        for row in conn.execute("SELECT * FROM published WHERE post_id IS NULL ORDER BY id").fetchall():
+            post_id = make_post_id(row["project"], row["channel"],
+                                   row["url"] or row["target_url"], row["label"])
+            if post_id in used:
+                log.warning("[migration] post_id collision for published row %s; retained without id",
+                            row["id"])
+                continue
+            conn.execute("UPDATE published SET post_id=? WHERE id=?", (post_id, row["id"]))
+            used.add(post_id)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pub_post_id ON published(post_id) "
+                     "WHERE post_id IS NOT NULL")
+        conn.execute("UPDATE metric_checks SET status='pending' WHERE status='error'")
+        for row in conn.execute("SELECT id, result FROM metric_checks WHERE status='done'").fetchall():
+            try:
+                result = json.loads(row["result"] or "{}")
+            except (ValueError, TypeError):
+                continue
+            if isinstance(result, dict) and result.get("checked") is False:
+                conn.execute("UPDATE metric_checks SET status='failed', retry_at=NULL, "
+                             "failure_reason=? WHERE id=?",
+                             (result.get("reason") or "legacy unchecked result", row["id"]))
 
 
 def meta_get(conn: sqlite3.Connection, key: str):
@@ -333,6 +404,96 @@ def meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
+
+
+# --------------------------------------------------------------------------
+# state machine (ledger only; no publishing capability)
+# --------------------------------------------------------------------------
+
+POST_FLOW = ("candidate", "fact_checked", "approved", "scheduled",
+             "published_verified", "measured", "evaluated")
+HOLD_STATES = ("needs_research", "no_demand_hold", "expired_hold")
+PRE_PUBLISH = POST_FLOW[:4]
+TRANSITIONS = {state: set() for state in POST_FLOW + HOLD_STATES}
+for _src, _dst in zip(POST_FLOW, POST_FLOW[1:]):
+    TRANSITIONS[_src].add(_dst)
+for _src in PRE_PUBLISH:
+    TRANSITIONS[_src].update(HOLD_STATES)
+for _src in HOLD_STATES:
+    TRANSITIONS[_src].add("candidate")
+
+
+def can_transition(src: str, dst: str) -> bool:
+    return dst in TRANSITIONS.get(src, ())
+
+
+def transition(conn, entity, entity_id, dst, now, reason="") -> str:
+    table = {"draft": "drafts", "post": "published"}.get(entity)
+    if table is None:
+        raise ValueError(f"unknown entity: {entity}")
+    # A savepoint also keeps state + audit atomic inside a caller's transaction.
+    conn.execute("SAVEPOINT post_transition")
+    try:
+        row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (entity_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown {entity}: {entity_id}")
+        src = row["state"]
+        if src != dst:
+            if not can_transition(src, dst):
+                raise ValueError(f"invalid transition: {src} -> {dst}")
+            conn.execute(f"UPDATE {table} SET state=?, hold_reason=? WHERE id=?",
+                         (dst, reason if dst in HOLD_STATES else None, entity_id))
+            conn.execute(
+                "INSERT INTO post_events (post_id, entity, entity_id, from_state, to_state, at, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (row["post_id"] if entity == "post" else None,
+                 entity, entity_id, src, dst, iso(now), reason))
+        conn.execute("RELEASE post_transition")
+    except Exception:
+        conn.execute("ROLLBACK TO post_transition")
+        conn.execute("RELEASE post_transition")
+        raise
+    return dst
+
+
+def make_post_id(project, channel, url=None, label=None) -> str:
+    identity = normalize_url(url) or (label or "").strip().lower()
+    value = f"{project or ''}|{channel or ''}|{identity}"
+    return "p_" + hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
+
+
+def record_post(conn, project, channel, target_url, label, now, state="scheduled") -> str:
+    """Record planned work, without asserting that anything has been published."""
+    if state not in PRE_PUBLISH + HOLD_STATES:
+        raise ValueError("record_post requires a pre-publication or hold state")
+    post_id = make_post_id(project, channel, target_url, label)
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO published "
+            "(post_id, project, channel, kind, target_url, label, state, published_at, source, first_seen) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ledger', ?)",
+            (post_id, project, channel, channel, normalize_url(target_url) or None,
+             label, state, iso(now), iso(now)))
+    return post_id
+
+
+def mark_published_verified(conn, post_id, post_url, verified_at, now):
+    """Record a confirmed public URL; measurement starts at verification time."""
+    url = normalize_url(post_url)
+    if not url:
+        raise ValueError("a public HTTP(S) post URL is required")
+    with conn:
+        row = conn.execute("SELECT * FROM published WHERE post_id=?", (post_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown post_id: {post_id}")
+        if row["state"] == "scheduled":
+            conn.execute("UPDATE published SET url=?, verified_at=?, published_at=? WHERE id=?",
+                         (url, iso(verified_at), iso(verified_at), row["id"]))
+            transition(conn, "post", row["id"], "published_verified", now)
+        elif row["state"] not in POST_FLOW[4:] or row["url"] != url:
+            raise ValueError(f"cannot verify post in state {row['state']}")
+        # Repeated verification preserves the original timestamp and due dates.
+    _queue_metric_checks(conn, now)
 
 
 # --------------------------------------------------------------------------
@@ -826,6 +987,83 @@ def content_hash(body: bytes) -> str:
 # 1. crawl
 # --------------------------------------------------------------------------
 
+PAGE_DEAD = ("gone", "expired")
+
+
+def hold_for_page(conn, project, page_url, now, reason):
+    counts = []
+    for entity, table, column in (("draft", "drafts", "page_url"),
+                                  ("post", "published", "target_url")):
+        rows = conn.execute(f"SELECT id, state FROM {table} WHERE project=? AND {column}=?",
+                            (project, page_url)).fetchall()
+        held = 0
+        for row in rows:
+            if row["state"] in PRE_PUBLISH:
+                transition(conn, entity, row["id"], "expired_hold", now, reason)
+                held += 1
+        counts.append(held)
+    return tuple(counts)
+
+
+def _mark_page_dead(conn, project, url, status, http_status, now):
+    if status not in PAGE_DEAD:
+        raise ValueError(f"invalid dead page status: {status}")
+    with conn:
+        conn.execute("UPDATE pages SET last_status=?, http_status=COALESCE(?, http_status), "
+                     "last_verified=? WHERE project=? AND url=?",
+                     (status, http_status, iso(now), project, url))
+        counts = hold_for_page(conn, project, url, now,
+                               f"page {status}: {url}")
+    return sum(counts)
+
+
+def reverify_pages(conn, fetcher, proj, cfg, now, stale_urls=None) -> dict:
+    """Expire dated evidence locally, then check a bounded set of stored URLs."""
+    result = {"checked": 0, "gone": 0, "expired": 0, "held": 0}
+    pages = conn.execute("SELECT * FROM pages WHERE project=? "
+                         "ORDER BY COALESCE(last_verified, ''), id", (proj.name,)).fetchall()
+    stale = set(stale_urls or ())
+    linked = set()
+    for table, column in (("drafts", "page_url"), ("published", "target_url")):
+        linked.update(r["url"] for r in conn.execute(
+            f"SELECT {column} AS url FROM {table} WHERE project=? "
+            "AND state IN ('candidate','fact_checked','approved','scheduled')", (proj.name,)))
+    candidates = []
+    for page in pages:
+        if page["last_status"] in PAGE_DEAD:
+            continue
+        deadline = parse_iso(page["valid_until"])
+        if deadline is not None and kst(deadline) < kst(now):
+            result["held"] += _mark_page_dead(conn, proj.name, page["url"], "expired", None, now)
+            result["expired"] += 1
+        elif page["url"] in stale or page["url"] in linked:
+            candidates.append(page)
+    cap = max(0, int(cfg["limits"].get("max_reverify_per_site", 10)))
+    for page in candidates:
+        if result["checked"] >= cap:
+            break
+        url = page["url"]
+        if not fetcher.can_fetch(url):
+            continue
+        res = fetcher.get(url, max_bytes=4096)
+        result["checked"] += 1
+        if res.status is None:
+            continue  # a connection failure establishes neither life nor death
+        if res.status in (404, 410):
+            result["held"] += _mark_page_dead(conn, proj.name, url, "gone", res.status, now)
+            result["gone"] += 1
+        else:
+            conn.execute("UPDATE pages SET http_status=?, last_verified=? WHERE project=? AND url=?",
+                         (res.status, iso(now), proj.name, url))
+    conn.commit()
+    dead = conn.execute("SELECT COUNT(*) AS n FROM pages WHERE project=? "
+                        "AND last_status IN ('gone','expired')", (proj.name,)).fetchone()["n"]
+    if dead:
+        blocker_upsert(conn, proj.name, "PAGES_GONE",
+                       f"{dead} stored page(s) gone or expired; related work held", iso(now))
+    return result
+
+
 def crawl_project(conn: sqlite3.Connection, fetcher: Fetcher, proj: Project,
                   cfg: dict, now: datetime, max_urls=None, max_fetches=None) -> None:
     limits = cfg["limits"]
@@ -838,7 +1076,7 @@ def crawl_project(conn: sqlite3.Connection, fetcher: Fetcher, proj: Project,
         "source": None, "urls_seen": 0, "new_count": 0, "changed_count": 0,
         "unchanged_count": 0, "fetches": 0, "robots_blocked": 0, "notes": [],
     }
-    keep_blockers = set()
+    keep_blockers = {"PAGES_GONE"}
 
     def note(msg):
         run_values["notes"].append(msg)
@@ -846,7 +1084,7 @@ def crawl_project(conn: sqlite3.Connection, fetcher: Fetcher, proj: Project,
 
     if not proj.url:
         ensure_config_blockers(conn, cfg, now)
-        blockers_deactivate(conn, proj.name, {"NO_PUBLIC_URL"})
+        blockers_deactivate(conn, proj.name, {"NO_PUBLIC_URL", "PAGES_GONE"})
         return
 
     base = proj.url.rstrip("/")
@@ -970,7 +1208,8 @@ def crawl_project(conn: sqlite3.Connection, fetcher: Fetcher, proj: Project,
     # ---- per-url processing --------------------------------------------
     # statuses describe the *latest* run: anything not rediscovered/re-fetched
     # below falls back to 'unchanged', so counts mean "new content this run".
-    conn.execute("UPDATE pages SET last_status='unchanged' WHERE project=?",
+    conn.execute("UPDATE pages SET last_status='unchanged' WHERE project=? "
+                 "AND last_status NOT IN ('gone','expired')",
                  (proj.name,))
     conn.commit()
     fetches = 0
@@ -982,6 +1221,9 @@ def crawl_project(conn: sqlite3.Connection, fetcher: Fetcher, proj: Project,
     for url, lastmod in url_list:
         lastmod = normalize_date(lastmod)
         prev = rows.get(url)
+        if prev is not None and prev["last_status"] in PAGE_DEAD:
+            rows.pop(url, None)
+            continue
         needs_fetch = prev is None or prev["content_hash"] is None or (
             lastmod is not None and lastmod != prev["lastmod"])
 
@@ -1007,6 +1249,18 @@ def crawl_project(conn: sqlite3.Connection, fetcher: Fetcher, proj: Project,
                         status = "unchanged"
                     _upsert_page(conn, proj.name, url, now, lastmod, digest,
                                  title, desc, status, fetched=True, prev=prev)
+                    conn.execute("UPDATE pages SET http_status=?, last_verified=? "
+                                 "WHERE project=? AND url=?", (res.status, started, proj.name, url))
+                    conn.commit()
+                    rows.pop(url, None)
+                    continue
+                if res.status in (404, 410):
+                    _upsert_page(conn, proj.name, url, now, lastmod,
+                                 prev["content_hash"] if prev else None,
+                                 prev["title"] if prev else None,
+                                 prev["description"] if prev else None,
+                                 "gone", fetched=True, prev=prev)
+                    _mark_page_dead(conn, proj.name, url, "gone", res.status, now)
                     rows.pop(url, None)
                     continue
                 fetch_errors += 1
@@ -1038,6 +1292,7 @@ def crawl_project(conn: sqlite3.Connection, fetcher: Fetcher, proj: Project,
                        f"{fetch_errors} page fetch(es) failed on this run", started)
         keep_blockers.add("FETCH_ERRORS")
 
+    reverify_pages(conn, fetcher, proj, cfg, now, stale_urls=list(rows))
     counts = conn.execute(
         "SELECT last_status, COUNT(*) AS n FROM pages WHERE project=? "
         "GROUP BY last_status", (proj.name,)).fetchall()
@@ -1661,18 +1916,21 @@ def process_rounds_log(conn: sqlite3.Connection, cfg: dict, now: datetime) -> in
         project, basis = map_project(line, url, projects)
         dedupe = hashlib.sha1(
             f"{line_no}|{url or label}".encode("utf-8", "replace")).hexdigest()
+        channel = "reddit" if is_reddit_url(url or "") else "web"
+        post_id = make_post_id(project, channel, url, label)
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO published
               (project, url, label, kind, published_at, source, line_no, raw_line,
-               mapping, due_hint_48h, due_hint_7d, dedupe_key, first_seen)
-            VALUES (?, ?, ?, ?, ?, 'rounds.log', ?, ?, ?, ?, ?, ?, ?)
+               mapping, due_hint_48h, due_hint_7d, dedupe_key, first_seen,
+               post_id, channel, state, verified_at)
+            VALUES (?, ?, ?, ?, ?, 'rounds.log', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'published_verified', ?)
             """,
-            (project, url, label, "reddit" if is_reddit_url(url or "") else "web",
+            (project, url, label, channel,
              iso(published_dt), line_no, line[:1000], basis or "no-match",
              iso(hints["48h"]) if hints.get("48h") else None,
              iso(hints["7d"]) if hints.get("7d") else None,
-             dedupe, now_s))
+             dedupe, now_s, post_id, channel, iso(published_dt)))
         if cur.rowcount:
             added += 1
     conn.commit()
@@ -1688,14 +1946,16 @@ def process_rounds_log(conn: sqlite3.Connection, cfg: dict, now: datetime) -> in
 def _queue_metric_checks(conn: sqlite3.Connection, now: datetime) -> None:
     """Make sure every published entry has a pending 48h and 7d check.
 
-    Due dates default to published_at + 48h / +7d; an explicit
+    Due dates default to verified_at + 48h / +7d; an explicit
     "48h check 10/23" note in rounds.log wins when present.
     """
     rows = conn.execute(
-        "SELECT id, published_at, due_hint_48h, due_hint_7d FROM published").fetchall()
+        "SELECT id, verified_at, due_hint_48h, due_hint_7d FROM published "
+        "WHERE state IN ('published_verified','measured','evaluated') "
+        "AND verified_at IS NOT NULL").fetchall()
     queued = 0
     for row in rows:
-        published_dt = parse_iso(row["published_at"])
+        published_dt = parse_iso(row["verified_at"])
         if published_dt is None:
             continue
         published_dt = kst(published_dt)
@@ -1719,34 +1979,40 @@ def _queue_metric_checks(conn: sqlite3.Connection, now: datetime) -> None:
 def run_due_checks(conn: sqlite3.Connection, fetcher: Fetcher, cfg: dict,
                    now: datetime) -> None:
     cap = int(cfg["limits"].get("max_metric_checks_per_run", 40))
+    max_attempts = max(1, int(cfg["limits"].get("metric_max_attempts", 3)))
+    retry_minutes = max(0, float(cfg["limits"].get("metric_retry_minutes", 60)))
     rows = conn.execute(
         """
         SELECT mc.id AS check_id, mc.check_kind, mc.due_at, mc.attempts,
                pub.id AS pub_id, pub.url, pub.label, pub.project
         FROM metric_checks mc
         JOIN published pub ON pub.id = mc.published_id
-        WHERE mc.status = 'pending' AND mc.due_at <= ?
-        ORDER BY mc.due_at
+        WHERE mc.status = 'pending' AND COALESCE(mc.retry_at, mc.due_at) <= ?
+        ORDER BY COALESCE(mc.retry_at, mc.due_at)
         LIMIT ?
         """, (iso(now), cap)).fetchall()
     if not rows:
         due_next = conn.execute(
-            "SELECT MIN(due_at) AS d FROM metric_checks WHERE status='pending'").fetchone()["d"]
+            "SELECT MIN(COALESCE(retry_at, due_at)) AS d FROM metric_checks WHERE status='pending'").fetchone()["d"]
         log.info("[metrics] no checks due (next pending: %s)", due_next or "none")
         return
     log.info("[metrics] %d check(s) due now", len(rows))
     for row in rows:
         result = _check_published(row, fetcher)
-        status = "done" if result.get("checked") else "error"
+        attempts = row["attempts"] + 1
+        checked = bool(result.get("checked"))
+        status = "done" if checked else ("failed" if attempts >= max_attempts else "pending")
+        retry_at = iso(now + timedelta(minutes=retry_minutes * attempts)) if status == "pending" else None
+        failure_reason = None if checked else (result.get("reason") or "metric check unconfirmed")
         conn.execute(
             """
             UPDATE metric_checks
-            SET status=CASE WHEN attempts + 1 >= 3 THEN 'done' ELSE ? END,
+            SET status=?,
                 attempts = attempts + 1,
                 checked_at = ?,
-                result = ?
+                result = ?, retry_at = ?, failure_reason = ?
             WHERE id = ?
-            """, (status, iso(now_kst()), json.dumps(result, ensure_ascii=False),
+            """, (status, iso(now), json.dumps(result, ensure_ascii=False), retry_at, failure_reason,
                   row["check_id"]))
         conn.commit()
         log.info("[metrics] %s %s %s -> %s", row["project"] or "unmapped",
@@ -1850,12 +2116,14 @@ def collect_status(conn: sqlite3.Connection, cfg: dict, now: datetime) -> dict:
     unmapped = conn.execute(
         "SELECT COUNT(*) AS n FROM published WHERE project IS NULL").fetchone()["n"]
     next_due = conn.execute(
-        "SELECT MIN(due_at) AS d FROM metric_checks WHERE status='pending'").fetchone()["d"]
+        "SELECT MIN(COALESCE(retry_at, due_at)) AS d FROM metric_checks WHERE status='pending'").fetchone()["d"]
     pending = conn.execute(
         "SELECT COUNT(*) AS n FROM metric_checks WHERE status='pending'").fetchone()["n"]
+    failed = conn.execute(
+        "SELECT COUNT(*) AS n FROM metric_checks WHERE status='failed'").fetchone()["n"]
     return {"projects": per_project, "global_blockers": global_blockers,
             "unmapped_published": unmapped, "next_due": next_due,
-            "pending_checks": pending}
+            "pending_checks": pending, "failed_checks": failed}
 
 
 def _metrics_cell(conn: sqlite3.Connection, project: str) -> str:
@@ -1884,6 +2152,9 @@ def _metrics_cell(conn: sqlite3.Connection, project: str) -> str:
     text = " · ".join(parts)
     if unknown:
         text += f" · {UNKNOWN} {unknown}"
+    failed = sum(1 for r in rows if r["status"] == "failed")
+    if failed:
+        text += f" · failed {failed}"
     return text or UNKNOWN
 
 
