@@ -11,6 +11,8 @@ Run:  python3 -I tests/test_offline.py
 """
 
 import json
+import contextlib
+import io
 import os
 import sqlite3
 import sys
@@ -1461,6 +1463,320 @@ def test_batch2_cli_lifecycle(tmp_dir):
     conn.close()
 
 
+# ---------------------------------------------------------------- Batch 3
+def batch3_fixture(tmp_dir):
+    cfg, conn, proj, now, qraw, eraw = batch2_fixture(tmp_dir)
+    cfg["metrics"]["dir"] = os.path.join(tmp_dir, "metrics")
+    batch2_write(cfg, "questions", proj.name, [qraw])
+    batch2_write(cfg, "evidence", proj.name, [eraw])
+    ab.run_demand_pipeline(conn, cfg, [proj], now)
+    ab.generate_question_drafts(conn, cfg, [proj], now)
+    draft = conn.execute("SELECT * FROM drafts WHERE question_id IS NOT NULL").fetchone()
+    return cfg, conn, proj, now, draft
+
+
+def batch3_rejects(name, action):
+    try:
+        action()
+    except ValueError:
+        check(name, True)
+    else:
+        check(name, False, "expected ValueError")
+
+
+def batch3_cli(cfg, now, *args):
+    path = os.path.join(os.path.dirname(cfg["paths"]["db"]), "cli-config.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({k: v for k, v in cfg.items() if not k.startswith("_")}, fh)
+    stdout, stderr = io.StringIO(), io.StringIO()
+    clock = ab.now_kst
+    try:
+        ab.now_kst = lambda: now
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = ab.main(["--config", path, *args])
+    finally:
+        ab.now_kst = clock
+    return rc, stdout.getvalue(), stderr.getvalue()
+
+
+def test_channel_formats_batch3(tmp_dir):
+    cfg, conn, proj, now, draft = batch3_fixture(tmp_dir)
+    with open(draft["path"], encoding="utf-8") as fh:
+        packet = fh.read()
+    channels = ("search_page", "instagram", "threads", "reddit")
+    blocks = {ch: code_block(packet, ch) for ch in channels}
+    check("batch3 formats: four distinct bodies", len(set(blocks.values())) == 4)
+    for ch in channels:
+        section = packet.split(f"\n## {ch}\n", 1)[1].split("\n## ", 1)[0]
+        check(f"batch3 formats: {ch} metadata", all(f"- {key}: " in section for key in
+              ("why_this_channel", "why_now", "evidence_ids", "channel")))
+        check(f"batch3 formats: {ch} reason specific", ab._why_this_channel(
+            {"language": "en", "natural_channel": "reddit"}, ch) in section)
+    check("batch3 formats: durable search answer", all(x in blocks["search_page"] for x in
+          ("slug:", "canonical:", "질문", "답", "근거", "source_url:", "verified_at:", "valid_until:")))
+    check("batch3 formats: card checklist", all(x in blocks["instagram"] for x in
+          ("[CARD 1/3]", "[CARD 2/3]", "[CARD 3/3]", "☐", "저장·공유")))
+    check("batch3 formats: three threads blocks", len(blocks["threads"].split("\n\n")) == 3 and
+          all(x in blocks["threads"] for x in ("의견 / Opinion:", "근거 / Evidence:", "질문 / Question:")))
+    check("batch3 formats: reddit answer and review gates", all(x in blocks["reddit"] for x in
+          ("Direct answer:", "홍보 허용", "관계 표시")) and "http" not in blocks["reddit"])
+    check("batch3 formats: draft metadata", all(draft[k] for k in
+          ("why_this_channel", "why_now", "evidence_ids", "asset_id", "keyword_cluster", "campaign_id")) and
+          set(draft["channels"].split(",")) == set(ab.QUESTION_PACKET_CHANNELS))
+    for ch in ("search_page", "threads", "instagram"):
+        link = next(url.rstrip() for url in ab.ABS_URL_RE.findall(blocks[ch]) if "utm_source=" in url)
+        utm = ab.parse_utm_attribution(link)
+        check(f"batch3 attribution: {ch} complete UTM", utm["utm_source"] == ch and
+              utm["utm_asset"] == draft["asset_id"] and utm["utm_brand"] == proj.name and
+              utm["utm_term"] == draft["keyword_cluster"] and utm["utm_campaign"] == draft["campaign_id"] and
+              utm["utm_content"] == draft["hook_type"])
+    q = conn.execute("SELECT * FROM questions WHERE id=?", (draft["question_id"],)).fetchone()
+    evidence = dict(ab.linked_evidence(conn, "draft", draft["id"])[0])
+    hooks = ab.generate_hooks(q, [evidence], proj, cfg)
+    for kind, label in (("career", "경력 지도"), ("comparison", "비교 카드")):
+        evidence["kind"] = kind
+        variant = ab.render_question_packet(proj, q, [evidence], hooks, cfg, now)
+        check(f"batch3 formats: instagram {kind}", label in code_block(variant, "instagram"))
+    evidence["allowed_claims"] = json.dumps(["Verified condition https://example.test/a and example.test/b"])
+    variant = ab.render_question_packet(proj, q, [evidence], hooks, cfg, now)
+    check("batch3 formats: reddit removes URLs from claims", "example.test" not in code_block(variant, "reddit"))
+    # Legacy page candidates also carry attribution and queue-required fields.
+    conn.execute("INSERT INTO crawl_runs(started,project,first_run) VALUES (?, ?, 0)", (ab.iso(now), proj.name))
+    ab.generate_drafts(conn, cfg, [proj], now, ab.iso(now))
+    page = conn.execute("SELECT * FROM drafts WHERE question_id IS NULL").fetchone()
+    check("batch3 formats: page candidate metadata", page is not None and all(page[k] for k in
+          ("asset_id", "keyword_cluster", "campaign_id", "hook_type", "why_this_channel", "why_now", "evidence_ids")))
+    with open(page["path"], encoding="utf-8") as fh:
+        page_packet = fh.read()
+    check("batch3 formats: page packet metadata", all(k in page_packet for k in
+          ("brand:", "asset_id:", "keyword_cluster:", "campaign_id:", "why_this_channel:", "evidence_ids:")))
+    conn.close()
+
+
+def test_approval_queue(tmp_dir):
+    cfg, conn, proj, now, draft = batch3_fixture(tmp_dir)
+    post_id = ab.record_post(conn, proj.name, "threads", draft["landing_url"], "queue fixture", now,
+                             state="candidate", draft_id=draft["id"])
+    post = conn.execute("SELECT * FROM published WHERE post_id=?", (post_id,)).fetchone()
+    check("batch3 queue: linked post inherits metadata", all(post[k] == draft[k] for k in
+          ("asset_id", "keyword_cluster", "campaign_id", "hook_type", "question_id", "evidence_ids")) and
+          "threads" in post["why_this_channel"] and post["why_now"] == draft["why_now"])
+    check("batch3 queue: filters", len(ab.queue_list(conn, proj.name, "candidate")) == 2 and
+          len(ab.queue_list(conn, entity="draft")) == 1 and len(ab.queue_list(conn, entity="post")) == 1 and
+          ab.queue_list(conn, project="goallit") == [] and ab.queue_list(conn, state="evaluated") == [])
+    batch3_rejects("batch3 queue: rejects unknown entity", lambda: ab.queue_list(conn, entity="evidence"))
+    batch3_rejects("batch3 queue: rejects unknown state", lambda: ab.queue_list(conn, state="made_up"))
+    batch3_rejects("batch3 queue: rejects state skip", lambda: ab.transition(conn, "post", post["id"], "scheduled", now))
+    batch3_rejects("batch3 queue: brand isolation", lambda: ab.record_post(
+        conn, "goallit", "threads", draft["landing_url"], "wrong brand", now, draft_id=draft["id"]))
+    check("batch3 queue: invalid work not inserted", conn.execute("SELECT COUNT(*) FROM published").fetchone()[0] == 1)
+    # Drafts expose the entire workflow, with each advance audited exactly once.
+    for state in ab.POST_FLOW[1:]:
+        ab.transition(conn, "draft", draft["id"], state, now)
+    check("batch3 queue: complete draft chain", ab.queue_list(conn, state="evaluated", entity="draft")[0]["id"] == draft["id"] and
+          conn.execute("SELECT COUNT(*) FROM post_events WHERE entity='draft'").fetchone()[0] == 6)
+    conn.commit()
+    rc, out, _ = batch3_cli(cfg, now, "queue", "list", "--project", proj.name, "--state", "candidate")
+    check("batch3 queue CLI: list", rc == 0 and post_id in out and "evaluated" not in out)
+    for state in ("fact_checked", "approved", "scheduled"):
+        rc, _, _ = batch3_cli(cfg, now, "queue", "move", "--entity", "post", "--id", str(post["id"]), "--to", state)
+        check(f"batch3 queue CLI: {state}", rc == 0)
+    rc, _, err = batch3_cli(cfg, now, "queue", "move", "--entity", "post", "--id", str(post["id"]), "--to", "published_verified")
+    check("batch3 queue CLI: cannot assert publication without URL", rc == 2 and "queue verify" in err and
+          conn.execute("SELECT COUNT(*) FROM metric_checks").fetchone()[0] == 0)
+    rc, _, _ = batch3_cli(cfg, now, "queue", "verify", "--post-id", post_id, "--url", "https://example.test/post",
+                          "--verified-at", "invalid")
+    check("batch3 queue CLI: invalid verification date rejected", rc == 2)
+    rc, _, _ = batch3_cli(cfg, now, "queue", "verify", "--post-id", post_id, "--url", "https://example.test/post",
+                          "--verified-at", ab.iso(now + timedelta(hours=1)))
+    check("batch3 queue CLI: future verification rejected", rc == 2)
+    for attempt in range(2):
+        rc, _, _ = batch3_cli(cfg, now, "queue", "verify", "--post-id", post_id, "--url", "https://example.test/post",
+                              "--verified-at", ab.iso(now))
+        check(f"batch3 queue CLI: verify attempt {attempt}", rc == 0)
+    checks = {r["check_kind"]: r["due_at"] for r in conn.execute("SELECT * FROM metric_checks")}
+    check("batch3 queue: verification queues two checks once", checks == {
+        "48h": ab.iso(now + timedelta(hours=48)), "7d": ab.iso(now + timedelta(days=7))})
+    for state in ("measured", "evaluated"):
+        rc, _, _ = batch3_cli(cfg, now, "queue", "move", "--entity", "post", "--id", str(post["id"]), "--to", state)
+        check(f"batch3 queue CLI: {state}", rc == 0)
+    check("batch3 queue: complete post chain audited", conn.execute(
+        "SELECT COUNT(*) FROM post_events WHERE entity='post'").fetchone()[0] == 6)
+    rc, _, _ = batch3_cli(cfg, now, "queue", "move", "--entity", "post", "--id", str(post["id"]), "--to", "approved")
+    check("batch3 queue CLI: backwards transition rejected", rc == 2)
+    expiring = ab.record_post(conn, proj.name, "reddit", draft["landing_url"], "expiry fixture", now, draft_id=draft["id"])
+    late = now + timedelta(days=11)
+    rc, _, _ = batch3_cli(cfg, late, "queue", "verify", "--post-id", expiring, "--url", "https://example.test/expired")
+    held = conn.execute("SELECT * FROM published WHERE post_id=?", (expiring,)).fetchone()
+    check("batch3 queue CLI: expired evidence blocks verification", rc == 2 and held["state"] == "expired_hold" and
+          held["verified_at"] is None and held["hold_reason"].startswith("evidence expired:"))
+    conn.close()
+
+
+def test_metrics_three_tiers(tmp_dir):
+    cfg, conn, proj, now, draft = batch3_fixture(tmp_dir)
+    post_id = ab.record_post(conn, proj.name, "threads", draft["landing_url"], "metrics fixture", now,
+                             draft_id=draft["id"])
+    for tier, metric in ((1, "views"), (2, "saves"), (3, "confirmed_purchases")):
+        mid = ab.record_metric(conn, tier, metric, 12, now, post_id=post_id, attribution="threads")
+        row = conn.execute("SELECT * FROM metric_observations WHERE id=?", (mid,)).fetchone()
+        check(f"batch3 metrics: tier {tier} inherits content", row["brand"] == proj.name and
+              row["post_id"] == post_id and row["channel"] == "threads" and all(row[k] == draft[k] for k in
+              ("asset_id", "keyword_cluster", "hook_type", "campaign_id")))
+    unknown_id = ab.record_metric(conn, 3, "resource_views", None, now, note="미확인")
+    unknown = conn.execute("SELECT * FROM metric_observations WHERE id=?", (unknown_id,)).fetchone()
+    check("batch3 metrics: honest unknown traffic/value", unknown["attribution"] == ab.DIRECT_UNKNOWN and
+          unknown["brand"] is None and unknown["value"] is None and unknown["note"] == "미확인")
+    check("batch3 metrics: dedupe manual observations", ab.record_metric(
+        conn, 3, "resource_views", None, now, note="미확인") is None)
+    for tier, metrics in ab.TIER_METRICS.items():
+        for metric in metrics:
+            check(f"batch3 metrics: supports {tier}/{metric}", ab.record_metric(
+                conn, tier, metric, 0, now, brand="goallit", window="48h") is not None)
+    bad_calls = [dict(tier=2, metric="views", value=1), dict(tier=4, metric="views", value=1),
+                 dict(tier=True, metric="views", value=1), dict(tier=1, metric="views", value=True),
+                 dict(tier=1, metric="views", value="9"), dict(tier=1, metric="views", value=float("nan")),
+                 dict(tier=1, metric="views", value=float("inf")), dict(tier=1, metric="views", value=-1),
+                 dict(tier=1, metric="views", value=1, observed_at="bad"),
+                 dict(tier=1, metric="views", value=1, observed_at=ab.iso(now + timedelta(days=1))),
+                 dict(tier=1, metric="views", value=1, entity="other"),
+                 dict(tier=1, metric="views", value=1, entity="post", entity_id=99999),
+                 dict(tier=1, metric="views", value=1, post_id=post_id, brand="goallit"),
+                 dict(tier=1, metric="views", value=1, post_id=post_id, campaign_id="other"),
+                 dict(tier=1, metric="views", value=1, source="invented")]
+    for i, args in enumerate(bad_calls):
+        batch3_rejects(f"batch3 metrics: rejects invalid input {i}", lambda args=args: ab.record_metric(conn, now=now, **args))
+    check("batch3 metrics: negative reddit score is valid", ab.record_metric(conn, 1, "score", -2, now) is not None)
+    conn.commit()
+    tracked = ab.add_utm(draft["landing_url"], "instagram", cfg["campaign"], draft["hook_type"],
+                         draft["asset_id"], draft["keyword_cluster"], proj.name)
+    entries = [dict(tier=2, metric="reach", value=30, post_id=post_id, observed_at=ab.iso(now), window="7d"),
+               dict(tier=3, metric="signups", value=2, landing_url=tracked, observed_at=ab.iso(now)),
+               dict(tier=3, metric="revisits", value=1, observed_at=ab.iso(now)),
+               dict(tier=3, metric="resource_views", value=None, landing_url=draft["landing_url"], observed_at=ab.iso(now)),
+               dict(tier=2, metric="saves", value=4, entity="draft", entity_id=draft["id"], observed_at=ab.iso(now)),
+               dict(tier=1, metric="likes", value=1),
+               dict(tier=3, metric="likes", value=1, observed_at=ab.iso(now)),
+               dict(tier=1, metric="likes", value=1, observed_at=ab.iso(now), post_id="missing"),
+               dict(tier=1, metric="likes", value=1, observed_at=ab.iso(now), brand="goallit"),
+               dict(tier=1, metric="likes", value=1, observed_at=ab.iso(now), landing_url=cfg["_projects"][1].url + "/review"),
+               None]
+    batch2_write(cfg, "metrics", proj.name, {"project": proj.name, "metrics": entries})
+    report = ab.import_metrics_dir(conn, cfg, [proj], now)
+    check("batch3 metrics: JSON envelope and rejection counts", report == {"imported": 5, "rejected": 6}, str(report))
+    check("batch3 metrics: JSON repeat idempotent across runs", ab.import_metrics_dir(
+        conn, cfg, [proj], now + timedelta(hours=1)) == {"imported": 0, "rejected": 6})
+    imported = conn.execute("SELECT * FROM metric_observations WHERE metric='signups' AND source='json_import'").fetchone()
+    check("batch3 metrics: UTM attribution", imported["attribution"] == "instagram" and imported["brand"] == proj.name and
+          imported["asset_id"] == draft["asset_id"] and imported["channel"] == "instagram")
+    direct = conn.execute("SELECT * FROM metric_observations WHERE metric='revisits' AND source='json_import'").fetchone()
+    check("batch3 metrics: JSON unknown does not inherit file brand", direct["brand"] is None and direct["attribution"] == ab.DIRECT_UNKNOWN)
+    landing_only = conn.execute("SELECT * FROM metric_observations WHERE metric='resource_views' AND source='json_import'").fetchone()
+    check("batch3 metrics: landing domain does not invent acquisition", landing_only["brand"] == proj.name and
+          landing_only["channel"] is None and landing_only["attribution"] == ab.DIRECT_UNKNOWN and landing_only["value"] is None)
+    batch2_write(cfg, "metrics", proj.name, {"project": "goallit", "metrics": entries})
+    check("batch3 metrics: wrong envelope rejected", ab.import_metrics_dir(conn, cfg, [proj], now) == {"imported": 0, "rejected": 1})
+    other_id = ab.record_post(conn, "goallit", "threads", "https://example.test/other", "other", now)
+    batch2_write(cfg, "metrics", proj.name, [dict(tier=1, metric="likes", value=1, post_id=other_id, observed_at=ab.iso(now))])
+    check("batch3 metrics: foreign post rejected", ab.import_metrics_dir(conn, cfg, [proj], now) == {"imported": 0, "rejected": 1})
+    batch2_write(cfg, "metrics", proj.name, entries[:1])
+    rc, out, _ = batch3_cli(cfg, now, "metrics", "import", "--project", proj.name)
+    check("batch3 metrics CLI: import local list", rc == 0 and json.loads(out)["imported"] == 0)
+    rc, out, _ = batch3_cli(cfg, now, "metrics", "record", "--tier", "2", "--metric", "shares", "--value", "5", "--post-id", post_id)
+    check("batch3 metrics CLI: manual input", rc == 0 and json.loads(out)["imported"] == 1)
+    rc, out, _ = batch3_cli(cfg, now, "metrics", "record", "--tier", "3", "--metric", "saves", "--value", "null")
+    check("batch3 metrics CLI: null input", rc == 0 and json.loads(out)["id"] is not None)
+    rc, _, _ = batch3_cli(cfg, now, "metrics", "record", "--tier", "2", "--metric", "likes", "--value", "3")
+    check("batch3 metrics CLI: wrong tier rejected", rc == 2)
+    rc, out, _ = batch3_cli(cfg, now, "metrics", "summary", "--project", proj.name)
+    check("batch3 metrics CLI: summary", rc == 0 and set(json.loads(out)["brands"]) == {proj.name})
+    malformed = [dict(tier=1, metric="likes", value=1, observed_at=ab.iso(now), post_id={"id": post_id}),
+                 dict(tier=1, metric="likes", value=1, observed_at=ab.iso(now), entity="draft", entity_id=float(draft["id"])),
+                 dict(tier=1, metric="likes", value=1, observed_at=ab.iso(now), entity_id=[]),
+                 dict(tier=1, metric="likes", value=1, observed_at=ab.iso(now), entity=[]),
+                 dict(tier=1, metric=["likes"], value=1, observed_at=ab.iso(now)),
+                 dict(tier=3, metric="signups", value=1, observed_at=ab.iso(now),
+                      landing_url=tracked.replace("utm_brand=hanset", "utm_brand=goallit"))]
+    batch2_write(cfg, "metrics", proj.name, malformed + [dict(tier=3, metric="revisits", value=8, observed_at=ab.iso(now))])
+    check("batch3 metrics: malformed identifiers isolated per entry", ab.import_metrics_dir(conn, cfg, [proj], now) ==
+          {"imported": 1, "rejected": len(malformed)})
+    # Both operational commands import locally, even with every network phase skipped.
+    for command, value in (("run", 9), ("status", 10)):
+        batch2_write(cfg, "metrics", proj.name, [dict(tier=3, metric="resource_views", value=value, observed_at=ab.iso(now))])
+        args = [command]
+        if command == "run":
+            args += ["--no-crawl", "--no-discover", "--no-demand", "--no-drafts", "--project", proj.name]
+        rc, _, _ = batch3_cli(cfg, now, *args)
+        check(f"batch3 metrics: {command} imports local insights", rc == 0 and conn.execute(
+            "SELECT id FROM metric_observations WHERE source='json_import' AND metric='resource_views' AND value=?",
+            (value,)).fetchone() is not None)
+    # Only genuine Reddit counters become tier-1 insights; HTTP status is liveness.
+    reddit = ab.record_post(conn, proj.name, "reddit", draft["landing_url"], "reddit fixture", now, draft_id=draft["id"])
+    ab.mark_published_verified(conn, reddit, "https://www.reddit.com/r/test/comments/fixture/", now - timedelta(days=8), now)
+    ab.mark_published_verified(conn, post_id, "https://example.test/post", now - timedelta(days=8), now)
+
+    class StubFetcher:
+        def can_fetch(self, url):
+            return True
+
+        def get(self, url, **kwargs):
+            payload = [{"data": {"children": [{"data": {"score": -3, "num_comments": 4}}]}}]
+            return ab.FetchResult(url, 200, json.dumps(payload).encode(), None, None, 0)
+
+    ab.run_due_checks(conn, StubFetcher(), cfg, now)
+    rows = conn.execute("SELECT * FROM metric_observations WHERE source='reddit_json'").fetchall()
+    check("batch3 metrics: reddit automatic tier 1", len(rows) == 4 and {r["window"] for r in rows} == {"48h", "7d"} and
+          {r["metric"] for r in rows} == {"score", "comments"} and all(r["tier"] == 1 and r["post_id"] == reddit for r in rows))
+    ab.run_due_checks(conn, StubFetcher(), cfg, now + timedelta(hours=1))
+    check("batch3 metrics: checks do not duplicate insights", conn.execute(
+        "SELECT COUNT(*) FROM metric_observations WHERE source='reddit_json'").fetchone()[0] == 4)
+    summary = ab.metrics_summary(conn, proj.name)
+    stats = summary["brands"][proj.name]
+    check("batch3 metrics: summary all tiers", all(stats["counts"][tier] > 0 for tier in (1, 2, 3)) and
+          stats["tiers"][1]["score"]["sum"] == -6 and stats["tiers"][3]["resource_views"]["sum"] is None)
+    status = ab.collect_status(conn, cfg, now)
+    check("batch3 metrics: status counts and unknown", status["projects"][proj.name]["tier_metrics"] == stats["counts"] and
+          status["unattributed"] > 0 and "metrics: hanset — t1 n=" in ab.render_status_md(status, cfg, now, "test") and
+          ab.DIRECT_UNKNOWN in ab.render_status_md(status, cfg, now, "test"))
+    conn.close()
+
+
+def test_config_batch3(tmp_dir):
+    cfg = make_cfg(tmp_dir)
+    with open(os.path.join(ROOT, "config.json"), encoding="utf-8") as fh:
+        raw = json.load(fh)
+    raw.pop("metrics", None)
+    path = os.path.join(tmp_dir, "legacy-config.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(raw, fh)
+    check("batch3 config: legacy metrics defaults", ab.load_config(path)["metrics"]["dir"] == "data/metrics")
+    conn = ab.db_connect(cfg)
+    conn.executescript("DROP TABLE drafts; DROP TABLE metric_observations; "
+                       "CREATE TABLE drafts(id INTEGER PRIMARY KEY,project TEXT,page_url TEXT,path TEXT,channels TEXT,"
+                       "created TEXT,UNIQUE(project,page_url));"
+                       "INSERT INTO drafts VALUES(1,'hanset','https://example.test/a','old.md','x','old');")
+    conn.close()
+    conn = ab.db_connect(cfg)
+    migrated = conn.execute("SELECT * FROM drafts").fetchone()
+    check("batch3 migration: preserved data and backfilled metadata", migrated["path"] == "old.md" and
+          migrated["asset_id"] and migrated["campaign_id"] == cfg["campaign"] and migrated["keyword_cluster"] == ab.UNKNOWN)
+    check("batch3 migration: new published columns", {"asset_id", "campaign_id", "keyword_cluster", "evidence_ids", "why_now", "why_this_channel"} <=
+          {r["name"] for r in conn.execute("PRAGMA table_info(published)")})
+    mid = ab.record_metric(conn, 3, "signups", 1, ab.now_kst())
+    conn.commit()
+    conn.close()
+    conn = ab.db_connect(cfg)
+    check("batch3 migration: repeated upgrade retains ledger", conn.execute("SELECT * FROM metric_observations WHERE id=?", (mid,)).fetchone() is not None and
+          conn.execute("SELECT asset_id FROM drafts").fetchone()[0] == migrated["asset_id"])
+    check("batch3 UTM: no source stays unknown", ab.parse_utm_attribution(None) is None and
+          ab.parse_utm_attribution("https://example.test/a?utm_campaign=fixture") is None and
+          ab.parse_utm_attribution("https://example.test/a?utm_source=") is None)
+    check("batch3 UTM: parse explicit source", ab.parse_utm_attribution("https://example.test/a?utm_source=threads&utm_campaign=fixture")["utm_source"] == "threads")
+    check("batch3 asset: deterministic and brand isolated", ab.make_asset_id("draft", "hanset", "a") == ab.make_asset_id("draft", "hanset", "a") and
+          ab.make_asset_id("draft", "hanset", "a") != ab.make_asset_id("draft", "goallit", "a"))
+    conn.close()
+
+
 def main():
     import tempfile
     print("offline tests for autobot.py")
@@ -1476,6 +1792,10 @@ def main():
     urllib.request.urlopen = local_urlopen
     server = start_server()
     try:
+        test_channel_formats_batch3(tempfile.mkdtemp(prefix="ab-batch3-formats-"))
+        test_approval_queue(tempfile.mkdtemp(prefix="ab-batch3-queue-"))
+        test_metrics_three_tiers(tempfile.mkdtemp(prefix="ab-batch3-metrics-"))
+        test_config_batch3(tempfile.mkdtemp(prefix="ab-batch3-config-"))
         test_question_candidates(tempfile.mkdtemp(prefix="ab-questions-"))
         test_evidence_validation(tempfile.mkdtemp(prefix="ab-evidence-"))
         test_evidence_expiry(tempfile.mkdtemp(prefix="ab-expiry-"))
