@@ -29,7 +29,10 @@
     ],
     "reddit_min_sleep": 6.0,
     "max_reddit_requests_per_run": 40,
-    "max_metric_checks_per_run": 40
+    "max_metric_checks_per_run": 40,
+    "metric_max_attempts": 3,
+    "metric_retry_minutes": 60,
+    "max_reverify_per_site": 10
   },
   "projects": [
     {
@@ -83,7 +86,7 @@
       "name": "goallit",
       "url": "https://goal-lit.soulbound.co.kr",
       "tagline_en": "GoalLit - Korean webtoon and web-novel reviews, critique and reading lists",
-      "tagline_ko": "골릿 - 웹툰·웹소설 리뷰와 비평, 추천 목록",
+      "tagline_ko": "꼴릿 - 웹툰·웹소설 리뷰와 비평, 추천 목록",
       "keywords": [
         "webtoon review",
         "web novel critique",
@@ -107,6 +110,7 @@
         "names": [
           "goallit",
           "goal-lit",
+          "꼴릿",
           "골릿"
         ],
         "terms": [
@@ -221,7 +225,7 @@
     },
     {
       "name": "agamajung",
-      "url": null,
+      "url": "https://agamajoong.soulbound.co.kr",
       "tagline_en": "agamajung - baby gear and stroller deal notes for Korea",
       "tagline_ko": "아가마중 - 국내 유아용품·유모차 혜택 정보",
       "keywords": [
@@ -238,9 +242,12 @@
       ],
       "rss_feeds": [],
       "aliases": {
-        "domains": [],
+        "domains": [
+          "agamajoong.soulbound.co.kr"
+        ],
         "names": [
           "agamajung",
+          "agamajoong",
           "아가마중"
         ],
         "terms": [
@@ -252,8 +259,7 @@
           "아기",
           "육아"
         ]
-      },
-      "blocker_note": "공개 URL 없음"
+      }
     }
   ],
   "daemon": {
