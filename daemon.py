@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 """Soulbound viral-autobot 7-stage dev & blueprint-audit daemon.
 
-Implements the 2026-10-23 19:47 KST 7-stage model and fallback order:
-  1. 설계 (design):            Opus 5.5 medium -> Codex astra 6 high -> GLM -> Swe2
-  2. 설계리뷰 (design_review):  Codex astra 6 high -> Opus 5.5 medium -> GLM -> Swe2
-  3. 개발 (build):             Codex sol 6.1 high -> Claude Sonnet high -> GLM -> Swe2
-  4. 개발리뷰 (build_review):   GLM -> Claude Sonnet 5.5 medium -> Codex sol 6.1 high -> Swe2
-  5. 리뷰에 따른 수정 (review_fix): Codex sol 6.1 high -> Claude Sonnet high -> GLM -> Swe2
-  6. 재리뷰 (re_review):        GLM -> Codex sol 6.1 high -> Claude Sonnet medium -> Swe2
-  7. 10개 PR마다 감리 (audit):  Fable medium -> Codex astra 6 high -> GLM -> Swe2
+Implements the 2026-11-03 12:55 KST 7-stage model and fallback order:
+  1. 설계 (design):            Codex astra 6 high -> Deepseek flash -> GLM -> Swe2
+  2. 설계리뷰 (design_review):  Deepseek flash -> Codex sol 6.1 high -> GLM -> Swe2
+  3. 개발 (build):             Codex sol 6.1 high -> Deepseek flash -> GLM -> Swe2
+  4. 개발리뷰 (build_review):   GLM -> Deepseek flash -> Codex sol 6.1 high -> Swe2
+  5. 리뷰에 따른 수정 (review_fix): Deepseek flash -> Codex sol 6.1 high -> GLM -> Swe2
+  6. 재리뷰 (re_review):        Devin (automatic) -> Deepseek flash -> Codex sol 6.1 high -> Swe2
+  7. 10개 PR마다 감리 (audit):  Codex astra 6 high -> GLM -> Swe2
 
 Audits every 10 merged PRs against BLUEPRINT.md and SPEC.md.
 """
@@ -49,53 +49,22 @@ FABLE_MODEL = "claude-fable-5-1"
 CODEX_ASTRA = "gpt-6-astra"
 CODEX_SOL = "gpt-6.1-sol"
 DEVIN_MODEL = "swe-2"
+DEVIN_AUTO = "automatic"
+DEEPSEEK_MODEL = "deepseek-flash"
+DEEPSEEK_ANTHROPIC_URL = "https://api.deepseek.com/anthropic"
+DEEPSEEK_CONFIG_DIR = os.path.join(HOME, ".claude-deepseek")
 AUDIT_EVERY_PRS = 10
 DEFAULT_REPO = "SUNBURN-Golden/viral-autobot"
 
 # Tuple representation matching peer box daemons (kixloop / onjeonloop / capitalloop / commerceloop)
 STAGES: Dict[str, List[Tuple[str, ...]]] = {
-    "design": [
-        ("claude", OPUS_MODEL, "medium"),
-        ("codex", CODEX_ASTRA, "high"),
-        ("glm",),
-        ("devin",),
-    ],
-    "design_review": [
-        ("codex", CODEX_ASTRA, "high"),
-        ("claude", OPUS_MODEL, "medium"),
-        ("glm",),
-        ("devin",),
-    ],
-    "build": [
-        ("codex", CODEX_SOL, "high"),
-        ("claude", SONNET_MODEL, "high"),
-        ("glm",),
-        ("devin",),
-    ],
-    "build_review": [
-        ("glm",),
-        ("claude", SONNET_MODEL, "medium"),
-        ("codex", CODEX_SOL, "high"),
-        ("devin",),
-    ],
-    "review_fix": [
-        ("codex", CODEX_SOL, "high"),
-        ("claude", SONNET_MODEL, "high"),
-        ("glm",),
-        ("devin",),
-    ],
-    "re_review": [
-        ("glm",),
-        ("codex", CODEX_SOL, "high"),
-        ("claude", SONNET_MODEL, "medium"),
-        ("devin",),
-    ],
-    "audit": [
-        ("claude", FABLE_MODEL, "medium"),
-        ("codex", CODEX_ASTRA, "high"),
-        ("glm",),
-        ("devin",),
-    ],
+    "design": [("codex", CODEX_ASTRA, "high"), ("deepseek",), ("glm",), ("devin",)],
+    "design_review": [("deepseek",), ("codex", CODEX_SOL, "high"), ("glm",), ("devin",)],
+    "build": [("codex", CODEX_SOL, "high"), ("deepseek",), ("glm",), ("devin",)],
+    "build_review": [("glm",), ("deepseek",), ("codex", CODEX_SOL, "high"), ("devin",)],
+    "review_fix": [("deepseek",), ("codex", CODEX_SOL, "high"), ("glm",), ("devin",)],
+    "re_review": [("devin", DEVIN_AUTO), ("deepseek",), ("codex", CODEX_SOL, "high"), ("devin",)],
+    "audit": [("codex", CODEX_ASTRA, "high"), ("glm",), ("devin",)],
 }
 
 STAGE_ALIASES: Dict[str, str] = {
@@ -293,6 +262,10 @@ def get_stage_chain(stage: str, config_path: str = CONFIG_PATH) -> List[Dict[str
             })
         elif prov == "glm":
             chain.append({"model": "glm", "provider": "glm"})
+        elif prov == "deepseek":
+            chain.append({"model": "dsflash", "provider": "deepseek", "id": DEEPSEEK_MODEL})
+        elif prov == "devin" and len(tup) > 1 and tup[1] == DEVIN_AUTO:
+            chain.append({"model": "devin_auto", "provider": "devin", "id": DEVIN_AUTO})
         else:
             chain.append({"model": "swe2", "provider": "devin", "id": DEVIN_MODEL})
     return chain
@@ -308,6 +281,8 @@ def lane_label(choice: Dict[str, Any]) -> str:
         return f"Codex ({choice.get('id', model)}) {effort or 'high'}"
     if prov == "glm":
         return "GLM (Claude CLI default profile)"
+    if prov == "deepseek":
+        return f"Deepseek flash ({choice.get('id', DEEPSEEK_MODEL)})"
     if prov == "devin":
         return f"Devin ({choice.get('id', DEVIN_MODEL)})"
     return f"{prov}:{model}"
@@ -508,6 +483,28 @@ def build_lane_command(
             cmd += ["--dangerously-skip-permissions"]
         return cmd, env
 
+    if provider == "deepseek":
+        key = raw_env.get("DEEPSEEK_API_KEY", "")
+        if not key:
+            raise LaneSkip("DEEPSEEK_API_KEY not set")
+        env = {k: v for k, v in raw_env.items() if not re.match(r"^(ANTHROPIC_|CLAUDE_CODE_)", k)}
+        # separate config dir so the default (GLM) profile's settings.json env does not override the endpoint
+        env["CLAUDE_CONFIG_DIR"] = choice.get("config_dir") or DEEPSEEK_CONFIG_DIR
+        env["ANTHROPIC_BASE_URL"] = DEEPSEEK_ANTHROPIC_URL
+        env["ANTHROPIC_AUTH_TOKEN"] = key
+        env["ANTHROPIC_MODEL"] = str(model_id or DEEPSEEK_MODEL)
+        env["ANTHROPIC_SMALL_FAST_MODEL"] = str(model_id or DEEPSEEK_MODEL)
+        env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        cmd = [CLAUDE_BIN, "-p", "--model", str(model_id or DEEPSEEK_MODEL), "--output-format", "json"]
+        if readonly:
+            cmd += ["--permission-mode", "default", "--allowedTools", "Read", "Grep", "Glob",
+                    "--disallowedTools", "Bash", "Edit", "Write", "MultiEdit", "NotebookEdit",
+                    "WebFetch", "WebSearch", "Task"]
+        else:
+            cmd += ["--dangerously-skip-permissions", "--disallowedTools", "WebFetch", "WebSearch"]
+        return cmd, env
+
     if provider == "devin":
         env = dict(raw_env)
         cmd = [
@@ -588,7 +585,7 @@ def execute_lane_subprocess(
         last_txt = open(last_file, "r", encoding="utf-8", errors="replace").read() if os.path.exists(last_file) else ""
         return rc, (last_txt if last_txt.strip() else raw_out), (raw_err + "\n" + raw_out[-1500:])
 
-    if provider in ("claude", "glm"):
+    if provider in ("claude", "glm", "deepseek"):
         try:
             payload = json.loads(raw_out)
             if isinstance(payload, list):
