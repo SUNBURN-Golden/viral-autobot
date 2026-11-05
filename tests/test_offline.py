@@ -2132,6 +2132,495 @@ def test_evaluation_edges_batch4(tmp_dir):
     conn.close()
 
 
+# Batch 5: offline operations tests. Existing Batch 1–4 cases remain unchanged.
+import ops.config as ops_config
+import ops.guards as ops_guards
+import ops.storage as ops_storage
+import ops.pipeline as ops_pipeline
+import ops.runner as ops_runner
+import ops.mocks as ops_mocks
+from unittest.mock import patch
+
+
+def ops_fixture(tmp_dir):
+    cfg, conn, proj, now, q, e = batch2_fixture(tmp_dir)
+    cfg['ops']['paths'].update(out=os.path.join(tmp_dir, 'out', 'ops'),
+                               dryrun_log=os.path.join(tmp_dir, 'logs', 'ops_dryrun.md'),
+                               prompts=os.path.join(ROOT, 'ops', 'prompts'))
+    cfg['ops']['accounts']['hanset']['x']['confirmed'] = True
+    cfg['metrics']['dir'] = os.path.join(tmp_dir, 'metrics')
+    qid = batch2_question(conn, cfg, proj, q, now)
+    eid = batch2_evidence(conn, proj, e, now)
+    ab.link_evidence(conn, eid, 'question', qid)
+    conn.execute("UPDATE questions SET state='ready' WHERE id=?", (qid,))
+    conn.commit()
+    ops_storage.ensure_ops_schema(conn)
+    return cfg, conn, proj, now, qid, eid
+
+
+def ops_mock(command, context):
+    return ops_mocks.response(command, context)
+
+
+def ops_cli(cfg, now, command, *args):
+    return batch3_cli(cfg, now, 'ops', command, *args)
+
+
+def ops_make_drafts(cfg, conn, proj, now):
+    result = ops_pipeline.cmd_draft(conn, cfg, proj, now, mock=ops_mock)
+    check('ops draft fixture succeeds', result['status'] == 'ok', result)
+    return result['drafts']
+
+
+def ops_approve(cfg, conn, proj, now, drafts):
+    ids = [d['id'] for d in drafts]
+    result = ops_pipeline.cmd_compliance(conn, cfg, proj, now, mock=ops_mock, ops_draft_ids=ids)
+    check('ops full checklist passes', result['verdict'] == 'PASS', result)
+    conn.execute("UPDATE drafts SET state='approved' WHERE id=?", (drafts[0]['draft_id'],))
+    conn.commit()
+
+
+def ops_expect_block(name, action, reason):
+    try:
+        action()
+    except ops_guards.OpsError as exc:
+        check(name, reason in str(exc), str(exc))
+    else:
+        check(name, False, 'expected OpsError')
+
+
+def ops_counts(conn):
+    return {t: conn.execute('SELECT COUNT(*) FROM ' + t).fetchone()[0] for t in (
+        'drafts', 'published', 'questions', 'evidence', 'evidence_links', 'ops_drafts', 'ops_compliance',
+        'ops_schedule', 'ops_publish_guides', 'ops_measure_notes')}
+
+
+def test_ops_config_batch5(tmp_dir):
+    cfg, conn, proj, now, qid, eid = ops_fixture(tmp_dir)
+    legacy = {'campaign': 'legacy'}
+    ops_config.apply_ops_defaults(legacy)
+    check('ops legacy config default', legacy['ops']['model'] == 'deepseek-flash')
+    legacy['ops']['model'] = 'custom-model'
+    legacy['ops']['utm']['campaign'] = ''
+    ops_config.apply_ops_defaults(legacy)
+    check('ops deep merge preserves overrides', legacy['ops']['model'] == 'custom-model' and legacy['ops']['utm']['campaign'] == 'legacy')
+    check('ops defaults independent', cfg['ops']['accounts']['hanset']['x']['confirmed'] is True and legacy['ops']['accounts']['hanset']['x']['confirmed'] is False)
+    ops_storage.ensure_ops_schema(conn)
+    check('ops schema idempotent', conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'ops_%'").fetchone()[0] == 6)
+    check('ops paths expanduser', ops_config.resolve_path('~/profile') == os.path.expanduser('~/profile'))
+    for name in ('pitchboard', 'goallit', 'agamajung'):
+        cfg['ops']['brands'][name]['enabled'] = True
+        ops_expect_block('ops unsupported brand ' + name, lambda: ops_guards.check_brand(cfg, name), 'brand_not_supported')
+    cfg['ops']['brands']['kitchengenome']['enabled'] = True
+    ops_expect_block('ops kitchen hold hard block', lambda: ops_guards.check_brand(cfg, 'kitchengenome'), 'brand_hold')
+    cfg['ops']['cost']['allow_paid_actions'] = True
+    ops_expect_block('ops paid config hard block', lambda: ops_guards.check_cost_config(cfg), 'paid_actions_forbidden')
+    cfg['ops']['cost']['allow_paid_actions'] = False
+    cfg['ops']['publish']['browser_automation'] = True
+    ops_expect_block('ops browser config hard block', lambda: ops_guards.check_cost_config(cfg), 'unsafe_publish_config')
+    conn.close()
+
+
+def test_ops_guards_batch5(tmp_dir):
+    cfg, conn, proj, now, qid, eid = ops_fixture(tmp_dir)
+    g = ops_guards
+    check('ops X URL and wide weighting', g.x_weighted_length('한₩🙂a https://example.test/a123') == 31)
+    check('ops wide char weight default wired', g.x_weighted_length('한', cfg) == 2)
+    cfg['ops']['limits']['wide_char_weight'] = 1
+    check('ops wide char weight override wired', g.x_weighted_length('한', cfg) == 1)
+    cfg['ops']['limits']['wide_char_weight'] = 2
+    check('ops utm defaults wired', ops_pipeline.utm_content(cfg, hook='hookA') == 'hookA' and ops_pipeline.utm_medium(cfg) == 'social')
+    check('ops X boundary', not g.validate_copy('x', 'a' * 280, None, proj, [], cfg) and 'x_length_exceeded' in g.validate_copy('x', 'a' * 281, None, proj, [], cfg))
+    check('ops Threads boundary', 'threads_length_exceeded' in g.validate_copy('threads', 'a' * 501, None, proj, [], cfg))
+    evidence = [{'fact': '9,000원', 'allowed_claims': '[]'}]
+    check('ops currency normalization', not g.unsupported_numbers('₩9,000 / 9,000원 / KRW 9000', evidence, cfg))
+    check('ops unitless and currency number guard', g.unsupported_numbers('3가지 이유, 5 tips, 12,000원', evidence, cfg) == ['unsupported_number:12000원', 'unsupported_number:3가지', 'unsupported_number:5tips'])
+    check('ops numeric labels excluded', g.copy_numbers('[CARD 1/3] 2026-11-05\n1. 안내 https://example.test/50') == [])
+    check('ops card hash included', g.content_hash('a', 'b') != g.content_hash('a', 'c'))
+    check('ops card number validated', 'unsupported_number:20%' in g.validate_copy('instagram', '안내', '[CARD 1/3] 20%', proj, evidence, cfg))
+    check('ops missing card rejected', 'card_copy_format' in g.validate_copy('instagram', '안내', None, proj, evidence, cfg))
+    check('ops forbidden terms all covered', len(g.find_prohibited('가짜 리뷰 부계정 댓글 알바 경쟁사 비방 체험단 미표기 저작권 이미지 무단 사용')) == 6)
+    text = g.redact('sk-secret Bearer abc password=pw otp=123456 https://example.test/?key=hidden', ['sk-secret'])
+    check('ops generic secret redaction', all(s not in text for s in ('sk-secret', 'Bearer abc', 'password=pw', 'otp=123456', 'hidden')))
+    check('ops quoted passwords redacted', 'with spaces' not in g.redact('password="with spaces"'))
+    with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'opaque-test-key'}):
+        check('ops dynamic secret blocked in copy', 'personal_or_secret_data' in g.validate_copy('x', 'opaque-test-key', None, proj, [], cfg))
+    check('ops card personal handles blocked', 'personal_or_secret_data' in g.validate_copy('instagram', '안내', '[CARD 1/3] @private_user', proj, [], cfg))
+    check('ops fabricated ISO date blocked', 'unsupported_date:2099-01-01' in g.unsupported_numbers('2099-01-01', evidence, cfg))
+    check('ops brand exclusions retained', any('brand_term' in r for r in g.validate_copy('x', '직접 가봤', None, proj, [], cfg)))
+    check('ops nested secret redaction', g.redact_obj({'api_key': 'opaque-value'})['api_key'] == '[REDACTED]')
+    account = cfg['ops']['accounts']['hanset']['x']
+    for alias in ('Crom_kr', 'crom_KR', '@AGAMAJUNG'):
+        account.update(alias=alias, confirmed=False)
+        check('ops forbidden account first ' + alias, g.check_account(cfg, 'hanset', 'x')[1] == 'forbidden_account')
+    account.update(alias='wrong', confirmed=True)
+    check('ops wrong X alias blocked', g.check_account(cfg, 'hanset', 'x')[1] == 'x_account_not_allowed')
+    account.update(alias='hanset_mag', confirmed=False)
+    cfg['ops']['account_rules']['confirmation_required'] = False
+    check('ops X confirmation cannot be disabled', g.check_account(cfg, 'hanset', 'x')[1] == 'x_account_confirmation_required')
+    for ch in ('threads', 'instagram'):
+        check('ops X-only confirmation ' + ch, g.check_account(cfg, 'hanset', ch)[1] is None)
+    g.validate_single_change('다음 발행 시 제목을 질문형으로')
+    for text in ('', 'a' * 121, '제목 교체 + 시간 변경', '제목 그리고 시간', 'A; B', '1) 제목', 'A\nB', 'A. B.'):
+        ops_expect_block('ops single change rejects ' + repr(text[:20]), lambda: g.validate_single_change(text), 'measure_multiple_changes')
+    import logging
+    logger = logging.getLogger('ops-secret-test')
+    streams = [io.StringIO(), io.StringIO()]
+    logger.handlers = [logging.StreamHandler(s) for s in streams]
+    logger.setLevel(logging.INFO)
+    g.install_redaction(logger, ['opaque-value'])
+    try:
+        raise ValueError('password=hidden opaque-value')
+    except ValueError:
+        logger.exception('Bearer abc %s', 'opaque-value')
+    check('ops all handlers and traceback redacted', all('hidden' not in s.getvalue() and 'opaque-value' not in s.getvalue() and 'Bearer abc' not in s.getvalue() for s in streams))
+    conn.close()
+
+
+def test_ops_plan_batch5(tmp_dir):
+    cfg, conn, proj, now, qid, eid = ops_fixture(tmp_dir)
+    with open(cfg['paths']['rounds_log'], 'w') as stream:
+        stream.write('password=plan-secret sk-test contact@example.test\nA verified local observation\n')
+    with open(cfg['paths']['status_md'], 'w') as stream:
+        stream.write('otp=123456\nContact contact@example.test\n')
+    before = ops_counts(conn)
+    rc, stdout, stderr = ops_cli(cfg, now, 'plan', '--dry-run')
+    result = json.loads(stdout)
+    check('ops plan dryrun CLI', rc == 0 and result['status'] == 'ok', stderr)
+    check('ops plan report exists', os.path.isfile(result['path']))
+    with open(cfg['ops']['paths']['dryrun_log']) as stream:
+        audit = stream.read()
+    run = conn.execute('SELECT * FROM ops_runs ORDER BY id DESC LIMIT 1').fetchone()
+    check('ops plan audit mode and template', run['mode'] == 'dry-run' and run['prompt_path'].endswith('/ops/prompts/plan.md'))
+    check('ops plan no business writes', before == ops_counts(conn))
+    from ops.context import plan_context
+    ctx = json.dumps(plan_context(conn, cfg, proj, now))
+    check('ops plan privacy across sinks', all(secret not in ctx + stdout + audit + run['output'] for secret in ('plan-secret', 'sk-test', 'contact@example.test', '123456')))
+    check('ops plan audit payload equals output', json.loads(run['output']) == result)
+    conn.close()
+
+
+def test_ops_draft_batch5(tmp_dir):
+    cfg, conn, proj, now, qid, eid = ops_fixture(tmp_dir)
+    before = ops_counts(conn)
+    result = ops_pipeline.cmd_draft(conn, cfg, proj, now, dry_run=True)
+    check('ops draft dryrun previews three channels', len(result['drafts']) == 3 and before == ops_counts(conn))
+    check('ops dryrun draft writes no files', not os.path.exists(os.path.join(cfg['ops']['paths']['out'], 'drafts')))
+    def partial(command, ctx):
+        response = ops_mock(command, ctx)
+        response['drafts'] = response['drafts'][:2]
+        return response
+    ops_expect_block('ops draft partial channel set rejected',
+                     lambda: ops_pipeline.cmd_draft(conn, cfg, proj, now, mock=partial), 'llm_output_invalid')
+    drafts = ops_make_drafts(cfg, conn, proj, now)
+    anchor = conn.execute('SELECT * FROM drafts').fetchone()
+    check('ops anchor required path and namespace', bool(anchor['path']) and os.path.isfile(anchor['path']) and anchor['page_url'].startswith('question:'))
+    check('ops channel draft persistence', conn.execute('SELECT COUNT(*) FROM ops_drafts').fetchone()[0] == 3 and len({d['channel'] for d in drafts}) == 3)
+    conn.execute("UPDATE drafts SET state='approved',page_url='https://example.test/existing' WHERE id=?", (anchor['id'],))
+    question = conn.execute('SELECT * FROM questions WHERE id=?', (qid,)).fetchone()
+    evidence = conn.execute('SELECT * FROM evidence WHERE id=?', (eid,)).fetchall()
+    a = ops_pipeline.ensure_anchor_draft(conn, proj, question, evidence, cfg, now, question['target_landing_url'])
+    b = ops_pipeline.ensure_anchor_draft(conn, proj, question, evidence, cfg, now, question['target_landing_url'])
+    row = conn.execute('SELECT * FROM drafts WHERE id=?', (a,)).fetchone()
+    check('ops anchor reuses question preserving approval', a == b == anchor['id'] and row['state'] == 'approved' and row['page_url'] == 'https://example.test/existing' and conn.execute('SELECT COUNT(*) FROM drafts').fetchone()[0] == 1)
+    conn.execute("UPDATE evidence SET valid_until='2000-01-01' WHERE id=?", (eid,))
+    result = ops_pipeline.cmd_draft(conn, cfg, proj, now, dry_run=True)
+    check('ops draft expired evidence skipped', result == {'status': 'skipped', 'reason': 'no_verified_evidence'})
+    conn.execute("UPDATE questions SET state='needs_research'")
+    check('ops draft empty question skipped', ops_pipeline.cmd_draft(conn, cfg, proj, now, dry_run=True)['reason'] == 'no_questions')
+    conn.close()
+
+
+def test_ops_compliance_batch5(tmp_dir):
+    cfg, conn, proj, now, qid, eid = ops_fixture(tmp_dir)
+    drafts = ops_make_drafts(cfg, conn, proj, now)
+    ids = [d['id'] for d in drafts]
+    before = ops_counts(conn)
+    result = ops_pipeline.cmd_compliance(conn, cfg, proj, now, dry_run=True, ops_draft_ids=ids)
+    check('ops compliance dryrun no business writes', result['verdict'] == 'PASS' and before == ops_counts(conn))
+    ops_approve(cfg, conn, proj, now, drafts)
+    def missing(command, ctx):
+        response = ops_mock(command, ctx)
+        response['checks'].pop('C9')
+        return response
+    result = ops_pipeline.cmd_compliance(conn, cfg, proj, now, mock=missing, ops_draft_ids=[ids[0]])
+    check('ops checklist missing fails closed', result['verdict'] == 'FAIL' and 'llm_check_missing:C9' in result['results'][0]['reasons'])
+    for checks in ({}, {'C1': {'pass': 1}}, {'C1': {'pass': 'true'}}):
+        result = ops_pipeline.cmd_compliance(conn, cfg, proj, now, mock={'compliance': {'verdict': 'PASS', 'reasons': [], 'checks': checks}}, ops_draft_ids=[ids[0]])
+        check('ops incomplete or nonboolean checklist fails', result['verdict'] == 'FAIL')
+    copy = '가짜 리뷰로 12,000원'
+    conn.execute('UPDATE ops_drafts SET copy=?,copy_hash=? WHERE id=?', (copy, ops_guards.content_hash(copy), ids[0]))
+    def forbidden_llm(*args, **kwargs):
+        raise AssertionError('code failure must not call LLM')
+    result = ops_pipeline.cmd_compliance(conn, cfg, proj, now, mock=forbidden_llm, ops_draft_ids=[ids[0]])
+    reasons = result['results'][0]['reasons']
+    check('ops compliance prohibited and invented number', result['verdict'] == 'FAIL' and 'prohibited:fake_review' in reasons and 'unsupported_number:12000원' in reasons)
+    ig = ids[2]
+    conn.execute("UPDATE ops_drafts SET card_copy='[CARD 1/3] 20%' WHERE id=?", (ig,))
+    result = ops_pipeline.cmd_compliance(conn, cfg, proj, now, mock=forbidden_llm, ops_draft_ids=[ig])
+    check('ops card edit invalidates PASS', 'stale_copy_hash' in result['results'][0]['reasons'])
+    draft = conn.execute('SELECT * FROM ops_drafts WHERE id=?', (ig,)).fetchone()
+    ops_expect_block('ops stale hash requires recheck', lambda: ops_pipeline.require_compliance_pass(conn, draft), 'stale_copy_hash')
+    with patch.dict(os.environ, {}, clear=True):
+        result = ops_pipeline.cmd_compliance(conn, cfg, proj, now, ops_draft_ids=[ids[1]])
+    check('ops missing key records compliance FAIL', 'llm_error:deepseek_key_missing' in result['results'][0]['reasons'])
+    conn.close()
+
+
+def test_ops_schedule_batch5(tmp_dir):
+    cfg, conn, proj, now, qid, eid = ops_fixture(tmp_dir)
+    drafts = ops_make_drafts(cfg, conn, proj, now)
+    did = drafts[0]['id']
+    before = ops_counts(conn)
+    result = ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=[did])
+    check('ops no PASS blocks schedule', result['status'] == 'blocked' and result['results'][0]['reason'] == 'compliance_pass_required')
+    check('ops blocked scheduling leaves queue unchanged', ops_counts(conn) == before)
+    ops_pipeline.cmd_compliance(conn, cfg, proj, now, mock=ops_mock, ops_draft_ids=[did])
+    result = ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=[did])
+    check('ops schedule requires human approval', result['results'][0]['reason'] == 'draft_not_approved')
+    conn.execute("UPDATE drafts SET state='approved'")
+    cfg['ops']['accounts']['hanset']['x']['confirmed'] = False
+    result = ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=[did])
+    check('ops schedule X confirmation', result['results'][0]['reason'] == 'x_account_confirmation_required')
+    cfg['ops']['accounts']['hanset']['x']['confirmed'] = True
+    before = ops_counts(conn)
+    result = ops_pipeline.cmd_schedule(conn, cfg, proj, now, dry_run=True, ops_draft_ids=[did])
+    check('ops schedule preview computes post identity', result['status'] == 'ok' and result['results'][0]['post_id'].startswith('p_') and before == ops_counts(conn))
+    result = ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=[did])
+    check('ops approved schedule succeeds', result['status'] == 'ok', result)
+    pid = result['results'][0]['post_id']
+    cfg['ops']['utm']['campaign'] = 'changed_campaign'
+    result2 = ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=[did])
+    post = conn.execute('SELECT * FROM published WHERE post_id=?', (pid,)).fetchone()
+    check('ops UTM changes keep stable identity', result2['status'] == 'ok' and result2['results'][0]['post_id'] == pid and conn.execute('SELECT COUNT(*) FROM published').fetchone()[0] == 1 and conn.execute('SELECT COUNT(*) FROM ops_schedule').fetchone()[0] == 1)
+    check('ops scheduled state and attribution', post['state'] == 'scheduled' and 'changed_campaign' in post['target_url'] and conn.execute('SELECT status FROM ops_drafts WHERE id=?', (did,)).fetchone()[0] == 'scheduled')
+    cfg['ops']['utm']['medium'] = 'newsletter'
+    result3 = ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=[did])
+    post = conn.execute('SELECT * FROM published WHERE post_id=?', (pid,)).fetchone()
+    check('ops UTM medium config wired', result3['status'] == 'ok' and 'utm_medium=newsletter' in post['target_url'])
+    cfg['ops']['utm']['medium'] = 'social'
+    conn.execute("UPDATE evidence SET valid_until='2000-01-01' WHERE id=?", (eid,))
+    result = ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=[did])
+    check('ops schedule rechecks expired evidence', result['status'] == 'blocked' and result['results'][0]['reason'] == 'evidence_expired')
+    check('ops expiration block records reason', 'evidence_expired' in conn.execute('SELECT blocked_reasons FROM ops_drafts WHERE id=?', (did,)).fetchone()[0])
+    conn.close()
+
+
+def test_ops_publish_guide_batch5(tmp_dir):
+    cfg, conn, proj, now, qid, eid = ops_fixture(tmp_dir)
+    drafts = ops_make_drafts(cfg, conn, proj, now)
+    ops_approve(cfg, conn, proj, now, drafts)
+    ids = [d['id'] for d in drafts]
+    ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=ids)
+    before = ops_counts(conn)
+    result = ops_pipeline.cmd_publish_guide(conn, cfg, proj, now, dry_run=True)
+    check('ops guide dryrun no writes', ops_counts(conn) == before)
+    check('ops missing IG asset blocks', result['status'] == 'blocked' and any(r.get('reason') == 'missing_card_asset' for r in result['results']))
+    result = ops_pipeline.cmd_publish_guide(conn, cfg, proj, now, ops_schedule_ids=[1, 2])
+    check('ops X and Threads guides written', result['status'] == 'ok' and conn.execute('SELECT COUNT(*) FROM ops_publish_guides').fetchone()[0] == 2)
+    guide = result['results'][0]['guide']
+    check('ops guide account safety payload', guide['account']['logout_allowed'] is False and guide['forbidden_accounts'] == ['Crom_kr', 'agamajung'] and guide['no_browser_automation'] is True)
+    check('ops guide measurement precondition', any('queue verify' in s for s in guide['checklist']))
+    check('ops guide_ready transition', conn.execute('SELECT status FROM ops_drafts WHERE id=?', (ids[0],)).fetchone()[0] == 'guide_ready')
+    row = conn.execute('SELECT * FROM ops_publish_guides LIMIT 1').fetchone()
+    check('ops guide JSON and MD exist', os.path.isfile(row['json_path']) and os.path.isfile(row['md_path']))
+    card = os.path.join(tmp_dir, 'card.png')
+    with open(card, 'wb') as stream:
+        stream.write(b'offline asset placeholder')
+    conn.execute('UPDATE ops_drafts SET card_path=? WHERE id=?', (card, ids[2]))
+    check('ops IG guide with local card', ops_pipeline.cmd_publish_guide(conn, cfg, proj, now, ops_schedule_ids=[3])['status'] == 'ok')
+    # Latest FAIL invalidates even a previously generated guide.
+    fail = ops_mock('compliance', {})
+    fail['checks']['C1']['pass'] = False
+    ops_pipeline.cmd_compliance(conn, cfg, proj, now, mock={'compliance': fail}, ops_draft_ids=[ids[0]])
+    result = ops_pipeline.cmd_publish_guide(conn, cfg, proj, now, ops_schedule_ids=[1])
+    check('ops FAIL refuses publish guide', result['status'] == 'blocked' and result['results'][0]['reason'] == 'compliance_pass_required')
+    before = ops_counts(conn)
+    result = ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=[ids[0]])
+    check('ops FAIL refuses schedule after former PASS', result['status'] == 'blocked' and ops_counts(conn) == before)
+    conn.close()
+
+
+def test_ops_measure_batch5(tmp_dir):
+    cfg, conn, proj, now, qid, eid = ops_fixture(tmp_dir)
+    pid = batch4_post(conn, now, 'ops-measure')
+    diagnosis = ab.diagnose_post(conn, cfg, pid, '48h', now)
+    before = ops_counts(conn)
+    with patch.object(ab, 'run_due_checks', side_effect=AssertionError('no network collection')) as due:
+        with patch.object(ab, 'process_rounds_log', wraps=ab.process_rounds_log) as rounds:
+            result = ops_pipeline.cmd_measure(conn, cfg, proj, now, dry_run=True)
+            check('ops measure dryrun read only', rounds.call_count == 0 and ops_counts(conn) == before)
+            result = ops_pipeline.cmd_measure(conn, cfg, proj, now, mock=ops_mock)
+            check('ops measure local pipeline reused', rounds.call_count == 1 and due.call_count == 0)
+    check('ops measure note persisted', result['status'] == 'ok' and conn.execute('SELECT COUNT(*) FROM ops_measure_notes').fetchone()[0] == 1)
+    note = conn.execute('SELECT payload FROM ops_measure_notes').fetchone()
+    check('ops measure alternative causes stored as list', isinstance(json.loads(note['payload'])['alternative_causes'], list))
+    check('ops measure holds canonical verdict', result['notes'][0]['verdict'] == diagnosis['verdict'] == '판정 보류' and result['notes'][0]['category'] == diagnosis['category'])
+    for label, value in (('missing', None), ('empty', []), ('nonstring', [1]), ('blank', ['  '])):
+        def broken_alternatives(command, ctx, value=value):
+            response = ops_mock(command, ctx)
+            if value is None:
+                response.pop('alternative_causes', None)
+            else:
+                response['alternative_causes'] = value
+            return response
+        ops_expect_block('ops measure alternative causes ' + label,
+                         lambda broken=broken_alternatives: ops_pipeline.cmd_measure(conn, cfg, proj, now, mock=broken),
+                         'llm_output_invalid')
+    def bad_numbers(command, ctx):
+        response = ops_mock(command, ctx)
+        response['actual_with_denominator'] = '999999 / 123456'
+        return response
+    ops_expect_block('ops measure fabricated number blocked', lambda: ops_pipeline.cmd_measure(conn, cfg, proj, now, mock=bad_numbers), 'measure_fabricated_number')
+    def multiple(command, ctx):
+        response = ops_mock(command, ctx)
+        response['next_single_change'] = '제목 교체 + 발행 시간 변경'
+        return response
+    ops_expect_block('ops measure multiple changes blocked', lambda: ops_pipeline.cmd_measure(conn, cfg, proj, now, mock=multiple), 'measure_multiple_changes')
+    def reclassify(command, ctx):
+        response = ops_mock(command, ctx)
+        response.update(category='low_signup', verdict='diagnosed')
+        return response
+    result = ops_pipeline.cmd_measure(conn, cfg, proj, now, mock=reclassify)
+    check('ops measure LLM cannot reclassify', result['notes'][0]['verdict'] == '판정 보류' and result['notes'][0]['category'] == diagnosis['category'])
+    check('ops measure upsert unique', conn.execute('SELECT COUNT(*) FROM ops_measure_notes').fetchone()[0] == 1)
+    conn.close()
+
+
+def test_ops_cli_dryrun_batch5(tmp_dir):
+    cfg = make_cfg(tmp_dir)
+    cfg['ops']['paths'].update(out=os.path.join(tmp_dir, 'ops-out'), dryrun_log=os.path.join(tmp_dir, 'ops-dryrun.md'), prompts=os.path.join(ROOT, 'ops', 'prompts'))
+    now = ab.now_kst()
+    conn = ab.db_connect(cfg)
+    ops_storage.ensure_ops_schema(conn)
+    before = ops_counts(conn)
+    with patch.dict(os.environ, {}, clear=True):
+        with patch.object(ops_runner.subprocess, 'run', side_effect=AssertionError('dryrun cannot spawn CLI')):
+            for name in ('plan', 'draft', 'compliance', 'schedule', 'publish-guide', 'measure'):
+                rc, stdout, stderr = ops_cli(cfg, now, name, '--dry-run')
+                result = json.loads(stdout)
+                check('ops dryrun CLI ' + name, rc == 0 and result['status'] in ('ok', 'skipped'), stderr)
+    check('ops six dryrun audits', conn.execute("SELECT COUNT(*) FROM ops_runs WHERE mode='dry-run'").fetchone()[0] == 6)
+    check('ops six dryrun business tables untouched', before == ops_counts(conn))
+    with open(cfg['ops']['paths']['dryrun_log']) as stream:
+        log = stream.read()
+    check('ops six dryrun log sections', log.count('\n## ') == 6)
+    with patch.dict(os.environ, {}, clear=True):
+        rc, stdout, stderr = ops_cli(cfg, now, 'plan')
+    check('ops live missing key rc2', rc == 2 and json.loads(stdout)['reason'] == 'deepseek_key_missing')
+    fixture = os.path.join(tmp_dir, 'mock.json')
+    with open(fixture, 'w') as stream:
+        json.dump({'plan': {'plan': 'password=do-not-leak contact@example.test opaque-key'}}, stream)
+    with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'opaque-key'}):
+        rc, stdout, stderr = ops_cli(cfg, now, 'plan', '--mock-file', fixture)
+    run = conn.execute('SELECT * FROM ops_runs ORDER BY id DESC LIMIT 1').fetchone()
+    with open(cfg['ops']['paths']['dryrun_log']) as stream:
+        log = stream.read()
+    check('ops mock CLI and all sinks safe', rc == 0 and run['mode'] == 'mock' and all(s not in stdout + stderr + log + run['output'] for s in ('do-not-leak', 'contact@example.test', 'opaque-key')))
+    rc, stdout, stderr = ops_cli(cfg, now, 'plan', '--project', 'kitchengenome', '--dry-run')
+    check('ops kitchen CLI blocked rc2', rc == 2 and json.loads(stdout)['reason'] == 'brand_hold')
+    with patch.object(ops_pipeline, 'cmd_plan', side_effect=ValueError('password=internal-secret')):
+        rc, stdout, stderr = ops_cli(cfg, now, 'plan', '--dry-run')
+    check('ops unexpected error safe rc1', rc == 1 and 'internal-secret' not in stderr and 'Traceback' in stderr)
+    conn.close()
+
+
+def test_ops_cli_mock_lifecycle_batch5(tmp_dir):
+    cfg, conn, proj, now, qid, eid = ops_fixture(tmp_dir)
+    evidence = dict(conn.execute('SELECT * FROM evidence WHERE id=?', (eid,)).fetchone())
+    fixture = os.path.join(tmp_dir, 'responses.json')
+    responses = {'draft': ops_mock('draft', {'evidence': [evidence]}),
+                 'compliance': ops_mock('compliance', {}), 'plan': {'plan': '# Offline plan'}}
+    with open(fixture, 'w') as stream:
+        json.dump(responses, stream)
+    def cli(command, *args):
+        with patch.dict(os.environ, {}, clear=True), patch.object(ops_runner.subprocess, 'run', side_effect=AssertionError('mock must not spawn CLI')):
+            rc, stdout, stderr = ops_cli(cfg, now, command, '--mock-file', fixture, *args)
+        return rc, json.loads(stdout), stderr
+    rc, result, stderr = cli('draft')
+    check('ops mock CLI draft creates local rows', rc == 0 and len(result['drafts']) == 3, stderr)
+    did = result['drafts'][0]['id']
+    rc, result, stderr = cli('schedule', '--ops-draft-id', str(did))
+    check('ops mock CLI schedule refuses missing PASS rc2', rc == 2 and result['results'][0]['reason'] == 'compliance_pass_required')
+    rc, result, stderr = cli('compliance', '--ops-draft-id', str(did))
+    check('ops mock CLI compliance PASS', rc == 0 and result['verdict'] == 'PASS')
+    anchor = conn.execute('SELECT id FROM drafts LIMIT 1').fetchone()[0]
+    ab.transition(conn, 'draft', anchor, 'fact_checked', now)
+    ab.transition(conn, 'draft', anchor, 'approved', now)
+    conn.commit()
+    with patch.object(ab, 'record_post', side_effect=ValueError('expired during scheduling')):
+        result = ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=[did])
+    check('ops record_post ValueError maps evidence block', result['results'][0]['reason'] == 'evidence_expired' and conn.execute('SELECT COUNT(*) FROM published').fetchone()[0] == 0 and conn.execute('SELECT COUNT(*) FROM ops_schedule').fetchone()[0] == 0)
+    rc, result, stderr = cli('schedule', '--ops-draft-id', str(did))
+    check('ops mock CLI approved schedule', rc == 0, result)
+    rc, result, stderr = cli('publish-guide', '--ops-schedule-id', '1')
+    check('ops mock CLI publish guide', rc == 0 and result['results'][0]['guide']['no_browser_automation'] is True)
+    responses['compliance']['checks']['C7']['pass'] = False
+    with open(fixture, 'w') as stream:
+        json.dump(responses, stream)
+    rc, result, stderr = cli('compliance', '--ops-draft-id', str(did))
+    check('ops mock CLI FAIL rc2', rc == 2 and result['verdict'] == 'FAIL')
+    rc, result, stderr = cli('publish-guide', '--ops-schedule-id', '1')
+    check('ops mock CLI FAIL blocks guide rc2', rc == 2 and result['results'][0]['reason'] == 'compliance_pass_required')
+    pid = batch4_post(conn, now, 'cli-measure')
+    diag = ab.diagnose_post(conn, cfg, pid, '48h', now)
+    responses['measure'] = ops_mock('measure', diag)
+    with open(fixture, 'w') as stream:
+        json.dump(responses, stream)
+    rc, result, stderr = cli('measure', '--post-id', pid)
+    check('ops mock CLI measure records notes', rc == 0 and len(result['notes']) == 1, stderr)
+    check('ops mock CLI no credential required audit', conn.execute("SELECT COUNT(*) FROM ops_runs WHERE mode='mock'").fetchone()[0] == 8)
+    conn.close()
+
+
+def test_ops_runner_batch5(tmp_dir):
+    import subprocess
+    cfg, conn, proj, now, qid, eid = ops_fixture(tmp_dir)
+    # These are fake process responses; the real CLI and network are never invoked.
+    calls = []
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs, kwargs['stdin'].name))
+        prompt = kwargs['stdin'].read()
+        check('ops runner prompt scrubbed', 'password=hidden' not in prompt and 'contact@example.test' not in prompt)
+        return subprocess.CompletedProcess(cmd, 0, json.dumps({'result': '{"plan":"safe"}'}), 'password=stderr-secret')
+    with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'opaque-key', 'ANTHROPIC_API_KEY': 'other-key', 'CLAUDE_CODE_OTHER': 'bad'}):
+        with patch.object(ops_runner.subprocess, 'run', side_effect=fake_run):
+            result = ops_runner.generate('plan', {'text': 'password=hidden contact@example.test'}, cfg)
+        check('ops runner parses Claude envelope', result['plan'] == 'safe')
+        cmd, kwargs, prompt_path = calls[0]
+        env = kwargs['env']
+        check('ops runner DeepSeek isolation', env['ANTHROPIC_BASE_URL'] == 'https://api.deepseek.com/anthropic' and env['ANTHROPIC_AUTH_TOKEN'] == 'opaque-key' and env['CLAUDE_CONFIG_DIR'] == os.path.expanduser('~/.claude-deepseek') and 'ANTHROPIC_API_KEY' not in env and 'CLAUDE_CODE_OTHER' not in env)
+        check('ops runner tool and MCP isolation', cmd[cmd.index('--tools') + 1] == '' and '--strict-mcp-config' in cmd and '--dangerously-skip-permissions' not in cmd)
+        check('ops runner secret not in arguments', 'opaque-key' not in str(cmd))
+        check('ops runner temp prompt and cwd removed', not os.path.exists(prompt_path) and not os.path.exists(kwargs['cwd']))
+        for exception, reason in ((subprocess.TimeoutExpired('fake', 1), 'llm_timeout'), (OSError('password=hidden'), 'llm_exit')):
+            with patch.object(ops_runner.subprocess, 'run', side_effect=exception):
+                ops_expect_block('ops runner maps ' + reason, lambda: ops_runner.generate('plan', {}, cfg), reason)
+        with patch.object(ops_runner.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, 'password=hidden', 'opaque-key')):
+            ops_expect_block('ops runner exit redacts provider details', lambda: ops_runner.generate('plan', {}, cfg), 'llm_exit')
+        with patch.object(ops_runner.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'not json sk-secret', '')):
+            ops_expect_block('ops runner invalid JSON', lambda: ops_runner.generate('plan', {}, cfg), 'llm_output_invalid')
+    for text in ('[]', 'null', '{"is_error":true,"result":"bad"}'):
+        ops_expect_block('ops runner invalid envelope', lambda: ops_runner.parse_response(text), 'llm_output_invalid')
+    conn.close()
+
+
+def test_ops_source_guards_batch5(tmp_dir):
+    import ast
+    sources = []
+    for name in os.listdir(os.path.join(ROOT, 'ops')):
+        if name.endswith('.py'):
+            with open(os.path.join(ROOT, 'ops', name)) as stream:
+                sources.append((name, stream.read()))
+    calls = [n for _, source in sources for n in ast.walk(ast.parse(source)) if isinstance(n, ast.Call)]
+    check('ops does not collect global due checks', not any(isinstance(n.func, ast.Attribute) and n.func.attr == 'run_due_checks' for n in calls))
+    source = '\n'.join(s for _, s in sources)
+    check('ops has no browser, payment, git or social SDK calls', all(term not in source for term in ('git push', 'git commit', 'playwright', 'selenium', 'stripe', 'tweepy', 'urlopen(')))
+    check('ops package init empty', os.path.getsize(os.path.join(ROOT, 'ops', '__init__.py')) == 0)
+    for name in ('config.py', 'guards.py', 'storage.py', 'mocks.py'):
+        check('ops independent module ' + name, 'import autobot' not in dict(sources)[name])
+
+
 def main():
     import tempfile
     print("offline tests for autobot.py")
@@ -2147,6 +2636,11 @@ def main():
     urllib.request.urlopen = local_urlopen
     server = start_server()
     try:
+        for test in (test_ops_cli_mock_lifecycle_batch5, test_ops_config_batch5, test_ops_guards_batch5, test_ops_plan_batch5,
+                     test_ops_draft_batch5, test_ops_compliance_batch5, test_ops_schedule_batch5,
+                     test_ops_publish_guide_batch5, test_ops_measure_batch5, test_ops_cli_dryrun_batch5,
+                     test_ops_runner_batch5, test_ops_source_guards_batch5):
+            test(tempfile.mkdtemp(prefix='ab-batch5-'))
         test_experiment_create_batch4(tempfile.mkdtemp(prefix="ab-batch4-create-"))
         test_funnel_snapshots_batch4(tempfile.mkdtemp(prefix="ab-batch4-funnel-"))
         test_diagnosis_five_class_batch4(tempfile.mkdtemp(prefix="ab-batch4-diagnose-"))

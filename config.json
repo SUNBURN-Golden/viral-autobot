@@ -497,15 +497,16 @@
     "stages": {
       "design": [
         {
+          "model": "opus55",
+          "provider": "claude",
+          "id": "claude-opus-5-5",
+          "effort": "medium"
+        },
+        {
           "model": "astra6",
           "provider": "codex",
           "id": "gpt-6-astra",
           "effort": "high"
-        },
-        {
-          "model": "dsflash",
-          "provider": "deepseek",
-          "id": "deepseek-flash"
         },
         {
           "model": "glm",
@@ -519,15 +520,16 @@
       ],
       "design_review": [
         {
-          "model": "dsflash",
-          "provider": "deepseek",
-          "id": "deepseek-flash"
+          "model": "astra6",
+          "provider": "codex",
+          "id": "gpt-6-astra",
+          "effort": "high"
         },
         {
-          "model": "sol61",
-          "provider": "codex",
-          "id": "gpt-6.1-sol",
-          "effort": "high"
+          "model": "opus55",
+          "provider": "claude",
+          "id": "claude-opus-5-5",
+          "effort": "medium"
         },
         {
           "model": "glm",
@@ -547,9 +549,10 @@
           "effort": "high"
         },
         {
-          "model": "dsflash",
-          "provider": "deepseek",
-          "id": "deepseek-flash"
+          "model": "sonnet",
+          "provider": "claude",
+          "id": "claude-sonnet-5-5",
+          "effort": "high"
         },
         {
           "model": "glm",
@@ -567,9 +570,10 @@
           "provider": "glm"
         },
         {
-          "model": "dsflash",
-          "provider": "deepseek",
-          "id": "deepseek-flash"
+          "model": "sonnet",
+          "provider": "claude",
+          "id": "claude-sonnet-5-5",
+          "effort": "medium"
         },
         {
           "model": "sol61",
@@ -585,14 +589,15 @@
       ],
       "review_fix": [
         {
-          "model": "dsflash",
-          "provider": "deepseek",
-          "id": "deepseek-flash"
-        },
-        {
           "model": "sol61",
           "provider": "codex",
           "id": "gpt-6.1-sol",
+          "effort": "high"
+        },
+        {
+          "model": "sonnet",
+          "provider": "claude",
+          "id": "claude-sonnet-5-5",
           "effort": "high"
         },
         {
@@ -607,14 +612,8 @@
       ],
       "re_review": [
         {
-          "model": "devin_auto",
-          "provider": "devin",
-          "id": "automatic"
-        },
-        {
-          "model": "dsflash",
-          "provider": "deepseek",
-          "id": "deepseek-flash"
+          "model": "glm",
+          "provider": "glm"
         },
         {
           "model": "sol61",
@@ -623,12 +622,24 @@
           "effort": "high"
         },
         {
+          "model": "sonnet",
+          "provider": "claude",
+          "id": "claude-sonnet-5-5",
+          "effort": "medium"
+        },
+        {
           "model": "swe2",
           "provider": "devin",
           "id": "swe-2"
         }
       ],
       "audit": [
+        {
+          "model": "fable",
+          "provider": "claude",
+          "id": "claude-fable-5-1",
+          "effort": "medium"
+        },
         {
           "model": "astra6",
           "provider": "codex",
@@ -717,5 +728,97 @@
       "guaranteed",
       "must-see"
     ]
+  },
+  "ops": {
+    "enabled": true,
+    "model": "deepseek-flash",
+    "claude_bin": "~/.local/bin/claude",
+    "config_dir": "~/.claude-deepseek",
+    "base_url": "https://api.deepseek.com/anthropic",
+    "timeout_seconds": 180,
+    "brands": {
+      "hanset": {
+        "enabled": true,
+        "hold": false
+      },
+      "pitchboard": {
+        "enabled": false,
+        "hold": false
+      },
+      "goallit": {
+        "enabled": false,
+        "hold": false
+      },
+      "kitchengenome": {
+        "enabled": false,
+        "hold": true
+      },
+      "agamajung": {
+        "enabled": false,
+        "hold": false
+      }
+    },
+    "channels": [
+      "x",
+      "threads",
+      "instagram"
+    ],
+    "forbidden_accounts": [
+      "Crom_kr",
+      "agamajung"
+    ],
+    "accounts": {
+      "hanset": {
+        "x": {
+          "alias": "hanset_mag",
+          "confirmed": false
+        },
+        "threads": {
+          "alias": "hanset_mag",
+          "confirmed": false
+        },
+        "instagram": {
+          "alias": "hanset_mag",
+          "confirmed": false
+        }
+      }
+    },
+    "account_rules": {
+      "confirmation_required": true,
+      "logout_allowed": false
+    },
+    "limits": {
+      "x_weighted": 280,
+      "url_weight": 23,
+      "wide_char_weight": 2,
+      "threads_chars": 500,
+      "max_drafts_per_run": 5,
+      "max_evidence_per_prompt": 12,
+      "max_context_chars": 12000,
+      "number_allowlist": []
+    },
+    "utm": {
+      "campaign": "viral_w1",
+      "content": "hook_type",
+      "medium": "social"
+    },
+    "paths": {
+      "out": "out/ops",
+      "dryrun_log": "logs/ops_dryrun.md",
+      "prompts": "ops/prompts"
+    },
+    "compliance": {
+      "block_on_fail": true,
+      "version": "2026-11-05"
+    },
+    "cost": {
+      "allow_paid_actions": false,
+      "allow_new_accounts": false
+    },
+    "publish": {
+      "browser_automation": false,
+      "require_compliance_pass": true,
+      "require_approved_draft": true
+    }
   }
 }
