@@ -264,6 +264,8 @@ def load_config(path: str) -> dict:
     limits.setdefault("max_question_drafts_per_run", 5)
     for raw in cfg.get("projects") or []:
         _set_defaults(raw.setdefault("demand", {}), BRAND_RULES.get(raw.get("name"), {}))
+    from ops.config import apply_ops_defaults
+    apply_ops_defaults(cfg)
     cfg["_projects"] = [Project(p) for p in (cfg.get("projects") or [])]
     names = [p.name for p in cfg["_projects"]]
     if len(names) != len(set(names)):
@@ -1078,13 +1080,14 @@ def normalize_url(url: str, base: str = "") -> str:
 
 
 def add_utm(url: str, channel: str, campaign: str, content=None,
-            asset_id=None, keyword_cluster=None, brand=None) -> str:
+            asset_id=None, keyword_cluster=None, brand=None, medium=None) -> str:
     """Merge utm_* params into an existing query string without clobbering it."""
     if not url:
         return url
     parts = urllib.parse.urlsplit(url)
     params = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
-    wanted = {"utm_source": channel, "utm_medium": "organic" if channel == "search_page" else "social",
+    wanted = {"utm_source": channel,
+              "utm_medium": medium if medium is not None else ("organic" if channel == "search_page" else "social"),
               "utm_campaign": campaign}
     if content is not None:
         wanted["utm_content"] = content
@@ -4152,6 +4155,11 @@ def cmd_daemon(args) -> int:
     return daemon_mod.main(["--config", args.config, args.action])
 
 
+def cmd_ops(args) -> int:
+    from ops.cli import run
+    return run(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="autobot.py",
@@ -4163,6 +4171,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="path to config.json (default: %(default)s)")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     sub = parser.add_subparsers(dest="command")
+
+    from ops.cli import add_parser as add_ops_parser
+    add_ops_parser(sub, cmd_ops)
 
     run = sub.add_parser("run", help="crawl + discover + draft + metrics + status")
     run.add_argument("--project", action="append", default=None,

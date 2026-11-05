@@ -58,13 +58,13 @@ DEFAULT_REPO = "SUNBURN-Golden/viral-autobot"
 
 # Tuple representation matching peer box daemons (kixloop / onjeonloop / capitalloop / commerceloop)
 STAGES: Dict[str, List[Tuple[str, ...]]] = {
-    "design": [("codex", CODEX_ASTRA, "high"), ("deepseek",), ("glm",), ("devin",)],
-    "design_review": [("deepseek",), ("codex", CODEX_SOL, "high"), ("glm",), ("devin",)],
-    "build": [("codex", CODEX_SOL, "high"), ("deepseek",), ("glm",), ("devin",)],
-    "build_review": [("glm",), ("deepseek",), ("codex", CODEX_SOL, "high"), ("devin",)],
-    "review_fix": [("deepseek",), ("codex", CODEX_SOL, "high"), ("glm",), ("devin",)],
-    "re_review": [("devin", DEVIN_AUTO), ("deepseek",), ("codex", CODEX_SOL, "high"), ("devin",)],
-    "audit": [("codex", CODEX_ASTRA, "high"), ("glm",), ("devin",)],
+    "design": [("claude", OPUS_MODEL, "medium"), ("codex", CODEX_ASTRA, "high"), ("glm",), ("devin",)],
+    "design_review": [("codex", CODEX_ASTRA, "high"), ("claude", OPUS_MODEL, "medium"), ("glm",), ("devin",)],
+    "build": [("codex", CODEX_SOL, "high"), ("claude", SONNET_MODEL, "high"), ("glm",), ("devin",)],
+    "build_review": [("glm",), ("claude", SONNET_MODEL, "medium"), ("codex", CODEX_SOL, "high"), ("devin",)],
+    "review_fix": [("codex", CODEX_SOL, "high"), ("claude", SONNET_MODEL, "high"), ("glm",), ("devin",)],
+    "re_review": [("glm",), ("codex", CODEX_SOL, "high"), ("claude", SONNET_MODEL, "medium"), ("devin",)],
+    "audit": [("claude", FABLE_MODEL, "medium"), ("codex", CODEX_ASTRA, "high"), ("glm",), ("devin",)],
 }
 
 STAGE_ALIASES: Dict[str, str] = {

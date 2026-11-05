@@ -238,3 +238,54 @@ python3 autobot.py rules rollback --project hanset --key hook_type --reason '후
 `cron.txt`에 KST 기준 실행 예시가 있습니다. 이 도구는 crontab을 설치하지 않습니다.
 운영자가 경로와 설정을 확인한 뒤 직접 적용합니다. 데몬 제어 명령은
 `python3 autobot.py daemon {start,stop,restart,status,stages,loop}`입니다.
+
+## Batch 5: DeepSeek 운용 CLI
+
+`python3 autobot.py ops`는 HANSET 질문·evidence·기존 승인 큐·성과 진단을 연결합니다. Python 3 표준 라이브러리만 사용하며, 게시·브라우저 자동화·계정 전환을 실행하지 않습니다. 다른 브랜드는 설정 훅만 제공하며 `blocked`입니다. Kitchen Genome은 `hold=true`일 때 항상 차단됩니다. 기존 SOULBOUND 제외 규칙은 유지합니다.
+
+라이브 문구 생성은 설치된 Claude CLI를 DeepSeek의 Anthropic-compatible endpoint `https://api.deepseek.com/anthropic`에 연결합니다. 인증은 환경변수 `DEEPSEEK_API_KEY`만 사용합니다. 키를 명령 인자·설정 파일에 넣지 마세요. 기본 모델은 `deepseek-flash`, 프로필은 격리된 `~/.claude-deepseek`입니다. `config.json`의 `ops.model`, `claude_bin`, `config_dir`로 조정합니다. 도구와 MCP를 비활성화하고 임시 프롬프트를 실행 후 삭제합니다. 프롬프트 템플릿은 `ops/prompts/*.md`에서 관리합니다.
+
+| 동작 | `--dry-run` | `--mock-file PATH` | 기본 live |
+| --- | --- | --- | --- |
+| LLM | 결정적 로컬 응답 | JSON fixture 응답 | DeepSeek CLI |
+| 외부 네트워크 | 없음 | 없음 | DeepSeek만 |
+| 비즈니스 원장 쓰기 | 없음 | 허용 | 허용 |
+| `ops_runs` 감사 행 | 씀 | 씀 | 씀 |
+| `logs/ops_dryrun.md` | append | append | 안 씀 |
+| 계획 보고서 | 씀 | 씀 | 씀 |
+
+`--config PATH`는 `ops` 앞에 둡니다. 키 없는 예시:
+
+```sh
+python3 autobot.py ops plan --project hanset --dry-run
+python3 autobot.py ops draft --project hanset --dry-run --limit 1
+python3 autobot.py ops compliance --ops-draft-id 1 --dry-run
+python3 autobot.py ops schedule --ops-draft-id 1 --dry-run
+python3 autobot.py ops publish-guide --ops-schedule-id 1 --dry-run
+python3 autobot.py ops measure --project hanset --dry-run
+```
+
+실제 로컬 초안을 만들려면 dry-run을 제거합니다. `plan`은 rounds.log/status.md와 DB를 읽어 `out/ops/plan/`에 1페이지 계획을 씁니다. `draft`는 ready/drafted 질문에 연결된 활성 evidence만 사용하며 X 가중 280자(URL=23, 한글·₩·이모지=2), Threads 500자, Instagram 카드 카피를 검사합니다. 숫자·가격·시간은 evidence corpus에 있어야 합니다. `--draft-id`로 기존 질문 앵커를 선택할 수 있습니다. `ops-draft-id`와 `ops-schedule-id`는 반복 가능합니다. 지정하지 않은 compliance/schedule은 최신 초안을 선택합니다. Instagram 실제 카드 파일은 사람이 준비하고 `ops_drafts.card_path`에 연결해야 가이드를 만들 수 있습니다.
+
+`compliance`는 한국 표시광고법·공정위 추천·보증 지침·플랫폼 규칙·커뮤니티 홍보 금지를 C1–C15 체크리스트로 검사합니다. 모든 항목에 명시적 boolean `pass=true`가 필요하며 누락·불확실·코드 검사 실패는 FAIL입니다. FAIL이면 schedule/publish-guide를 거부합니다. PASS는 현재 copy와 card_copy의 composite hash에만 유효합니다. 법률·플랫폼 규칙의 최신성 및 증빙은 담당자가 검토하고 evidence와 템플릿을 갱신해야 합니다.
+
+기존 `queue`에서 앵커를 `fact_checked` → `approved`로 승인한 뒤 schedule을 실행합니다. X는 `ops.accounts.hanset.x.confirmed=true`로 실제 `@hanset_mag` 확인을 기록해야 합니다. `@Crom_kr`·`@agamajung`은 대소문자와 관계없이 금지하며 어떤 계정도 로그아웃하지 않습니다. Threads/Instagram은 별도 X 확인 조건 없이 허용 alias를 검사합니다. 예약에는 `utm_campaign`과 `utm_content`를 붙이고 ops 초안 ID로 중복을 방지합니다.
+
+`publish-guide`는 채널·계정·승인된 본문(`copy`)·추적 링크를 붙인 최종 문구(`delivery_copy`)·UTM·카드 경로·체크리스트가 있는 JSON/MD를 `out/ops/publish_guides/`에 씁니다. 최종 문구도 채널 길이 제한을 검사합니다. 사람이 직접 게시한 후:
+
+```sh
+python3 autobot.py queue verify <post_id> <공개_URL>
+python3 autobot.py run --project hanset --no-crawl --no-discover --no-demand --no-drafts
+python3 autobot.py metrics import --project hanset
+python3 autobot.py ops measure --project hanset --post-id <post_id>
+```
+
+48h/7d 공개 지표 수집은 기존 metrics 수집 경로를 그대로 사용합니다. ops measure가 이를 대체하거나 외부 페이지를 요청하지 않습니다. `queue verify`로 공개 URL을 확인하고 해당 기간 지표 검사가 완료되어야 진단 대상입니다. measure는 로컬 rounds 로그·metrics import·기존 진단을 재사용하고 5분류 및 `판정 보류`를 유지한 문구 초안만 생성합니다. 실제 수치/분모의 숫자와 다음 단일 변경도 코드로 검사합니다.
+
+오프라인 mock fixture는 명령별 응답 객체를 담습니다. 예: `{"plan":{"plan":"오늘의 계획"},"compliance":{"verdict":"PASS","reasons":[],"checks":{"C1":{"pass":true,"note":"..."}}}}`. 실제 PASS fixture에는 C1–C15 전체가 필요합니다. mock PASS도 기존 사람 승인과 계정 확인을 대신하지 않습니다. 비즈니스 행 검증에는 mock을 쓰고, dry-run은 감사 행·로그·계획 보고서 외에는 쓰지 않습니다.
+
+빈 입력은 `skipped`/rc 0, 정책 차단·키 없음·LLM 오류는 `blocked`/rc 2, 예기치 못한 오류는 rc 1입니다. 비밀값과 외부 개인정보는 프롬프트·stdout·로그·감사 출력에서 정화합니다. 가짜 리뷰·부계정·댓글 알바·경쟁사 비방·체험단 미표기·저작권 이미지 무단 사용을 금지하며 광고비·유료 툴 결제·신규 계정 생성 경로는 없습니다. DeepSeek 추론은 설정된 API 사용량을 소비할 수 있습니다. daemon의 기존 PR 흐름을 유지하며 main 직접 push 경로를 추가하지 않습니다.
+
+PR 제목: `feat(ops): DeepSeek-brain viral ops bot (plan/draft/compliance/schedule/measure)`
+
+기존 오프라인 테스트와 현재 daemon 단계 설정의 불일치도 수정했습니다. 기본 단계 순서는 SPEC.md의 7단계 표와 맞추었고 DeepSeek 레인과 사용자 지정 단계 설정 지원은 유지합니다.

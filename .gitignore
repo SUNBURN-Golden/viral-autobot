@@ -1,6 +1,7 @@
 __pycache__/
 data/
-logs/
+logs/*
+!logs/ops_dryrun.md
 logs_claude.txt
 out/
 *.env
