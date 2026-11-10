@@ -28,9 +28,16 @@ SECRET_PATTERNS = (
 _SECRET_KEYS = re.compile(r'(?i)^(?:password|passwd|pwd|api[_-]?key|apikey|secret|token|access[_-]?token|client[_-]?secret|otp|인증번호)$')
 
 
+REGISTERED_SECRETS = set()
+
+
+def register_secret(value):
+    if value: REGISTERED_SECRETS.add(value)
+
+
 def redact(text, secrets=()):
     text = str(text)
-    values = [s for s in (*secrets, os.environ.get('DEEPSEEK_API_KEY', '')) if s]
+    values = [s for s in (*secrets, *REGISTERED_SECRETS, os.environ.get('DEEPSEEK_API_KEY', ''), os.environ.get('X_BEARER_TOKEN', '')) if s]
     for secret in sorted(values, key=len, reverse=True):
         text = text.replace(secret, '[REDACTED]')
     for pattern in SECRET_PATTERNS:

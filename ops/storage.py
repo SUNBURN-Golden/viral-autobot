@@ -35,4 +35,40 @@ CREATE TABLE IF NOT EXISTS ops_measure_notes (
 
 
 def ensure_ops_schema(conn):
-    conn.executescript(SCHEMA)
+    conn.executescript(SCHEMA + LIVE_SCHEMA)
+    if 'snapshot_id' not in {r[1] for r in conn.execute('PRAGMA table_info(ops_measure_notes)')}:
+        conn.execute('ALTER TABLE ops_measure_notes ADD COLUMN snapshot_id INTEGER REFERENCES ops_metric_snapshots(id)')
+    # compliance_verdict distinguishes a business block from a compliance FAIL.
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='ops_packages'").fetchone()
+    if row and "'SKIPPED'" not in (row[0] or ''):
+        conn.executescript("""
+        ALTER TABLE ops_packages RENAME TO ops_packages_legacy;
+        CREATE TABLE ops_packages (
+         id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES ops_runs(id), project TEXT NOT NULL,
+         package_date TEXT NOT NULL, checked_date TEXT NOT NULL, packet_hash TEXT NOT NULL,
+         package_hash TEXT, output_dir TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('ready','blocked')),
+         blocked_reasons TEXT NOT NULL, compliance_verdict TEXT NOT NULL CHECK(compliance_verdict IN ('PASS','FAIL','SKIPPED')),
+         compliance_checks TEXT NOT NULL, created TEXT NOT NULL
+        );
+        INSERT INTO ops_packages SELECT * FROM ops_packages_legacy;
+        DROP TABLE ops_packages_legacy;
+        """)
+    conn.commit()
+
+
+LIVE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ops_packages (
+ id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES ops_runs(id), project TEXT NOT NULL,
+ package_date TEXT NOT NULL, checked_date TEXT NOT NULL, packet_hash TEXT NOT NULL,
+ package_hash TEXT, output_dir TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('ready','blocked')),
+ blocked_reasons TEXT NOT NULL, compliance_verdict TEXT NOT NULL CHECK(compliance_verdict IN ('PASS','FAIL','SKIPPED')),
+ compliance_checks TEXT NOT NULL, created TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ops_metric_snapshots (
+ id INTEGER PRIMARY KEY, project TEXT NOT NULL, post_id TEXT NOT NULL,
+ check_kind TEXT NOT NULL CHECK(check_kind IN ('48h','7d')), public_url TEXT NOT NULL,
+ channel TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('manual','x_public_api','unverified')),
+ observed_at TEXT, collected_at TEXT NOT NULL, payload TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ UNIQUE(project,post_id,check_kind,payload_hash)
+);
+"""

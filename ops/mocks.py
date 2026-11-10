@@ -3,6 +3,12 @@ from .guards import CHECKLIST
 
 
 def response(command, context):
+    if command == 'package':
+        from .package import mock_package
+        return mock_package(context)
+    if command == 'plan_next':
+        from .strategy import mock_plan
+        return mock_plan(context)
     if command == 'plan':
         return {'plan': '# 오늘의 HANSET 운용 계획\n\n검증된 자료와 만료일을 확인한다.\n질문에 맞는 채널 초안을 준비하고 승인과 compliance PASS 후 예약한다.\n발행은 사람이 계정을 확인한 후 수행한다.\n공개 지표 확인 후 다음 실험에서 한 가지만 바꾼다.'}
     if command == 'draft':

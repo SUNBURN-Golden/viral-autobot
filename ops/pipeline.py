@@ -51,6 +51,7 @@ def skipped(reason):
 
 
 def project_checks(cfg, proj):
+    guards.register_secret(os.environ.get(cfg['ops']['measure']['x_bearer_env'], ''))
     guards.check_brand(cfg, proj.name)
     guards.check_cost_config(cfg)
 
@@ -191,14 +192,21 @@ def utm_medium(cfg):
     return cfg['ops']['utm'].get('medium') or None
 
 
-def cmd_plan(conn, cfg, proj, now, *, dry_run=False, mock=None, **kwargs):
+def cmd_plan(conn, cfg, proj, now, *, dry_run=False, mock=None, mode='daily', **kwargs):
+    if mode == 'next-week':
+        from .strategy import run
+        return run(conn, cfg, proj, now, dry_run=dry_run, mock=mock, **kwargs)
     project_checks(cfg, proj)
     result = runner.generate('plan', context.plan_context(conn, cfg, proj, now), cfg, dry_run=dry_run, mock=mock)
     plan = result.get('plan')
     if not isinstance(plan, str) or not plan.strip():
         raise OpsLLMError('llm_output_invalid')
     plan = context.clean(plan)[:8000]
-    path = out_path(cfg, 'plan', f'{ab.kst(now):%Y%m%d}_{proj.name}_plan.md')
+    if dry_run:
+        run_id = kwargs.get('run_id') or begin_run(conn, 'plan', proj.name, cfg, mode='dry-run', now=now)
+        path = out_path(cfg, 'previews', str(run_id), 'plan.md')
+    else:
+        path = out_path(cfg, 'plan', f'{ab.kst(now):%Y%m%d}_{proj.name}_plan.md')
     write_file(path, plan + '\n')
     return {'status': 'ok', 'path': path, 'plan': plan}
 
@@ -268,8 +276,11 @@ def cmd_draft(conn, cfg, proj, now, *, dry_run=False, mock=None, draft_id=None, 
             copy = copy.replace(landing, utm) if landing in copy and utm not in copy else copy
             reasons += guards.validate_copy(ch, copy, card, proj, evidence, cfg)
             reasons += delivery_length_reasons(ch, copy, utm, cfg)
+            from .compliance import evaluate_compliance
+            compliance = evaluate_compliance({'copy': copy, 'card_copy': card, 'evidence': payload['evidence']}, reasons, cfg, dry_run=dry_run, mock=mock)
+            reasons = compliance['reasons']
             result = {'channel': ch, 'copy': copy, 'card_copy': card, 'utm_url': utm,
-                      'copy_hash': guards.content_hash(copy, card), 'status': 'blocked' if reasons else 'draft',
+                      'copy_hash': guards.content_hash(copy, card), 'status': 'blocked' if reasons else 'compliant',
                       'blocked_reasons': sorted(set(reasons)), 'draft_id': anchor_id}
             if not dry_run:
                 cur = conn.execute('INSERT INTO ops_drafts(project,draft_id,question_id,channel,copy,card_copy,copy_hash,evidence_ids,'
@@ -277,6 +288,8 @@ def cmd_draft(conn, cfg, proj, now, *, dry_run=False, mock=None, draft_id=None, 
                                    (proj.name, anchor_id, q['id'], ch, copy, card, result['copy_hash'], dumps([e['id'] for e in evidence]),
                                     landing, utm, hook, campaign, result['status'], dumps(result['blocked_reasons']), ab.iso(now), ab.iso(now)))
                 result['id'] = cur.lastrowid
+                conn.execute('INSERT INTO ops_compliance(ops_draft_id,copy_hash,verdict,reasons,checks,version,checked_at) VALUES (?,?,?,?,?,?,?)',
+                             (cur.lastrowid, result['copy_hash'], compliance['verdict'], dumps(reasons), dumps(compliance['checks']), cfg['ops']['compliance']['version'], ab.iso(now)))
                 write_file(out_path(cfg, 'drafts', proj.name, f'{cur.lastrowid}_{ch}.md'), copy + '\n\n' + (card or ''))
             results.append(result)
         if not dry_run:
@@ -296,34 +309,9 @@ def cmd_compliance(conn, cfg, proj, now, *, dry_run=False, mock=None, ops_draft_
     results = []
     for draft in drafts:
         reasons, evidence = draft_code_reasons(conn, cfg, proj, draft, now)
-        checks = guards.compliance_code_checks(reasons)
-        verdict = 'FAIL'
-        if not reasons:
-            data = {'draft': context.clean(dict(draft)), 'evidence': context.evidence_context(evidence, cfg),
-                    'checklist': guards.CHECKLIST}
-            try:
-                response = runner.generate('compliance', data, cfg, dry_run=dry_run, mock=mock)
-                llm_checks = response.get('checks')
-                llm_checks = llm_checks if isinstance(llm_checks, dict) else {}
-                for key in guards.CHECKLIST:
-                    check = llm_checks.get(key)
-                    if check is None:
-                        reasons.append('llm_check_missing:' + key)
-                    elif not isinstance(check, dict) or type(check.get('pass')) is not bool:
-                        reasons.append('llm_check_invalid:' + key)
-                    elif check['pass'] is not True:
-                        reasons.append('llm_check_failed:' + key)
-                checks.update({k: llm_checks[k] for k in guards.CHECKLIST if k in llm_checks})
-                llm_reasons = response.get('reasons')
-                if not isinstance(llm_reasons, list) or any(not isinstance(r, str) for r in llm_reasons):
-                    reasons.append('llm_reasons_invalid')
-                else:
-                    reasons.extend(llm_reasons)
-                if response.get('verdict') != 'PASS':
-                    reasons.append('llm_verdict_fail')
-                verdict = 'FAIL' if reasons else 'PASS'
-            except OpsLLMError as exc:
-                reasons.append('llm_error:' + str(exc))
+        from .compliance import evaluate_compliance
+        evaluated = evaluate_compliance({'draft': context.clean(dict(draft)), 'evidence': context.evidence_context(evidence, cfg)}, reasons, cfg, dry_run=dry_run, mock=mock)
+        checks, verdict, reasons = evaluated['checks'], evaluated['verdict'], evaluated['reasons']
         result = {'ops_draft_id': draft['id'], 'verdict': verdict, 'reasons': sorted(set(reasons)), 'checks': checks}
         if not dry_run:
             conn.execute('INSERT INTO ops_compliance(ops_draft_id,copy_hash,verdict,reasons,checks,version,checked_at) VALUES (?,?,?,?,?,?,?)',
@@ -335,7 +323,7 @@ def cmd_compliance(conn, cfg, proj, now, *, dry_run=False, mock=None, ops_draft_
     if not dry_run:
         conn.commit()
     failed = any(r['verdict'] == 'FAIL' for r in results)
-    return {'status': 'blocked' if failed and cfg['ops']['compliance']['block_on_fail'] else 'ok',
+    return {'status': 'blocked' if failed else 'ok',
             'verdict': 'FAIL' if failed else 'PASS', 'results': results}
 
 
@@ -463,7 +451,10 @@ def cmd_publish_guide(conn, cfg, proj, now, *, dry_run=False, mock=None, ops_sch
     return {'status': 'blocked' if any(r['status'] == 'blocked' for r in results) else 'ok', 'results': results}
 
 
-def cmd_measure(conn, cfg, proj, now, *, dry_run=False, mock=None, post_id=None, **kwargs):
+def cmd_measure(conn, cfg, proj, now, *, dry_run=False, mock=None, post_id=None, check_kind=None, **kwargs):
+    if check_kind:
+        from .metrics import run
+        return run(conn, cfg, proj, now, dry_run=dry_run, mock=mock, post_id=post_id, check_kind=check_kind, **kwargs)
     project_checks(cfg, proj)
     if not dry_run:
         ab.process_rounds_log(conn, cfg, now)
@@ -483,10 +474,8 @@ def cmd_measure(conn, cfg, proj, now, *, dry_run=False, mock=None, post_id=None,
         if (not isinstance(alternatives, list) or not alternatives
                 or any(not isinstance(cause, str) or not cause.strip() for cause in alternatives)):
             raise OpsLLMError('llm_output_invalid')
-        corpus = row['actual_with_denominator'] + ' ' + ' '.join(f'{row[k]:g}' for k in ('numerator', 'denominator') if row[k] is not None)
-        if set(guards.copy_numbers(response['actual_with_denominator'])) - set(guards.copy_numbers(corpus)):
-            raise OpsBlocked('measure_fabricated_number')
-        guards.validate_single_change(response['next_single_change'])
+        from .metrics import validate_note
+        validate_note(response, row['actual_with_denominator'])
         response['category'] = row['category']
         response['verdict'] = row['verdict']
         response['post_id'] = row['post_id']
@@ -500,3 +489,8 @@ def cmd_measure(conn, cfg, proj, now, *, dry_run=False, mock=None, post_id=None,
     if not dry_run:
         conn.commit()
     return {'status': 'ok', 'notes': results}
+
+
+def cmd_package(conn, cfg, proj, now, **kwargs):
+    from .package import run
+    return run(conn, cfg, proj, now, **kwargs)

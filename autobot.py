@@ -74,7 +74,7 @@ METRIC_WINDOWS = ("48h", "7d")
 EXPERIMENT_VARIABLES = ("hook_type", "channel", "landing_page", "posting_window")
 POSTING_WINDOWS = (("dawn", 0), ("morning", 6), ("afternoon", 12), ("evening", 18))
 TIER_METRICS = {
-    1: {"views", "likes", "comments", "score"},
+    1: {"views", "likes", "comments", "score", "replies", "reposts"},
     2: {"reach", "shares", "saves", "watch", "link_clicks"},
     3: {"resource_views", "comparisons", "saves", "signups", "revisits", "confirmed_purchases"},
 }
@@ -2758,7 +2758,7 @@ FILE_EXT_TLD = {
     "css", "pdf", "zip", "gz", "tar", "sql", "conf", "toml", "ini",
 }
 ROUND_HEADER_RE = re.compile(
-    r"===\s*Round\s+(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})", re.I)
+    r"===\s*(?:Round\s+)?(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})", re.I)
 FULL_DT_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?")
 MD_HM_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})\b")
 MD_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
@@ -2839,7 +2839,7 @@ def record_metric(conn, tier, metric, value, now, entity="site", entity_id=None,
     observed = now if observed_at is None else observed
     if not isinstance(observed, datetime) or kst(observed) > kst(now):
         raise ValueError("observed_at must be a valid, non-future ISO datetime")
-    if source not in ("manual", "json_import", "reddit_json"):
+    if source not in ("manual", "json_import", "reddit_json", "x_public_api"):
         raise ValueError("invalid metric source")
     for text in (brand, attribution, window, note, asset_id, keyword_cluster, hook_type, channel, campaign_id):
         if text is not None and not isinstance(text, str):
@@ -3148,7 +3148,8 @@ def process_rounds_log(conn: sqlite3.Connection, cfg: dict, now: datetime) -> in
         project, basis = map_project(line, url, projects)
         dedupe = hashlib.sha1(
             f"{line_no}|{url or label}".encode("utf-8", "replace")).hexdigest()
-        channel = "reddit" if is_reddit_url(url or "") else "web"
+        from ops.metrics import channel_for
+        channel = "reddit" if is_reddit_url(url or "") else (channel_for(url or "") or "web")
         post_id = make_post_id(project, channel, url, label)
         cur = conn.execute(
             """
