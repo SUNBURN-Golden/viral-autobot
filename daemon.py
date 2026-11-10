@@ -299,12 +299,15 @@ def parse_verdict(text: str) -> Optional[str]:
 
 
 def is_limit_or_unavailable(rc: int, text: str, stderr: str = "") -> bool:
-    combined = f"{text or ''}\n{stderr or ''}"
-    if LIMIT_RE.search(combined):
+    """A lane is unavailable on a non-zero exit, empty output, or a short limit notice.
+
+    A successful lane (rc=0) with substantial output is never skipped just because
+    its own content mentions words like "limit" or "quota" (2026-11-10 fix: Batch 06
+    design output was discarded as a false positive)."""
+    out = (text or "").strip()
+    if rc != 0 or not out:
         return True
-    if rc != 0:
-        return True
-    if not (text or "").strip():
+    if len(out) < 600 and LIMIT_RE.search(out):
         return True
     return False
 

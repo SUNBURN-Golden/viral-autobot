@@ -497,16 +497,15 @@
     "stages": {
       "design": [
         {
-          "model": "opus55",
-          "provider": "claude",
-          "id": "claude-opus-5-5",
-          "effort": "medium"
-        },
-        {
           "model": "astra6",
           "provider": "codex",
           "id": "gpt-6-astra",
           "effort": "high"
+        },
+        {
+          "model": "dsflash",
+          "provider": "deepseek",
+          "id": "deepseek-flash"
         },
         {
           "model": "glm",
@@ -520,16 +519,15 @@
       ],
       "design_review": [
         {
-          "model": "astra6",
-          "provider": "codex",
-          "id": "gpt-6-astra",
-          "effort": "high"
+          "model": "dsflash",
+          "provider": "deepseek",
+          "id": "deepseek-flash"
         },
         {
-          "model": "opus55",
-          "provider": "claude",
-          "id": "claude-opus-5-5",
-          "effort": "medium"
+          "model": "sol61",
+          "provider": "codex",
+          "id": "gpt-6.1-sol",
+          "effort": "high"
         },
         {
           "model": "glm",
@@ -549,10 +547,9 @@
           "effort": "high"
         },
         {
-          "model": "sonnet",
-          "provider": "claude",
-          "id": "claude-sonnet-5-5",
-          "effort": "high"
+          "model": "dsflash",
+          "provider": "deepseek",
+          "id": "deepseek-flash"
         },
         {
           "model": "glm",
@@ -570,10 +567,9 @@
           "provider": "glm"
         },
         {
-          "model": "sonnet",
-          "provider": "claude",
-          "id": "claude-sonnet-5-5",
-          "effort": "medium"
+          "model": "dsflash",
+          "provider": "deepseek",
+          "id": "deepseek-flash"
         },
         {
           "model": "sol61",
@@ -589,15 +585,14 @@
       ],
       "review_fix": [
         {
+          "model": "dsflash",
+          "provider": "deepseek",
+          "id": "deepseek-flash"
+        },
+        {
           "model": "sol61",
           "provider": "codex",
           "id": "gpt-6.1-sol",
-          "effort": "high"
-        },
-        {
-          "model": "sonnet",
-          "provider": "claude",
-          "id": "claude-sonnet-5-5",
           "effort": "high"
         },
         {
@@ -612,8 +607,14 @@
       ],
       "re_review": [
         {
-          "model": "glm",
-          "provider": "glm"
+          "model": "devin_auto",
+          "provider": "devin",
+          "id": "automatic"
+        },
+        {
+          "model": "dsflash",
+          "provider": "deepseek",
+          "id": "deepseek-flash"
         },
         {
           "model": "sol61",
@@ -622,24 +623,12 @@
           "effort": "high"
         },
         {
-          "model": "sonnet",
-          "provider": "claude",
-          "id": "claude-sonnet-5-5",
-          "effort": "medium"
-        },
-        {
           "model": "swe2",
           "provider": "devin",
           "id": "swe-2"
         }
       ],
       "audit": [
-        {
-          "model": "fable",
-          "provider": "claude",
-          "id": "claude-fable-5-1",
-          "effort": "medium"
-        },
         {
           "model": "astra6",
           "provider": "codex",

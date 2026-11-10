@@ -593,32 +593,31 @@ def test_daemon_stages_and_fallback(tmp_dir):
     check("daemon: audit_every_prs == 10", dcfg.get("audit_every_prs") == 10, str(dcfg.get("audit_every_prs")))
 
     expected = {
-        "design": [("opus55", "claude", "claude-opus-5-5", "medium"),
-                   ("astra6", "codex", "gpt-6-astra", "high"),
+        "design": [("astra6", "codex", "gpt-6-astra", "high"),
+                   ("dsflash", "deepseek", "deepseek-flash", None),
                    ("glm", "glm", None, None),
                    ("swe2", "devin", "swe-2", None)],
-        "design_review": [("astra6", "codex", "gpt-6-astra", "high"),
-                          ("opus55", "claude", "claude-opus-5-5", "medium"),
+        "design_review": [("dsflash", "deepseek", "deepseek-flash", None),
+                          ("sol61", "codex", "gpt-6.1-sol", "high"),
                           ("glm", "glm", None, None),
                           ("swe2", "devin", "swe-2", None)],
         "build": [("sol61", "codex", "gpt-6.1-sol", "high"),
-                  ("sonnet", "claude", "claude-sonnet-5-5", "high"),
+                  ("dsflash", "deepseek", "deepseek-flash", None),
                   ("glm", "glm", None, None),
                   ("swe2", "devin", "swe-2", None)],
         "build_review": [("glm", "glm", None, None),
-                         ("sonnet", "claude", "claude-sonnet-5-5", "medium"),
+                         ("dsflash", "deepseek", "deepseek-flash", None),
                          ("sol61", "codex", "gpt-6.1-sol", "high"),
                          ("swe2", "devin", "swe-2", None)],
-        "review_fix": [("sol61", "codex", "gpt-6.1-sol", "high"),
-                       ("sonnet", "claude", "claude-sonnet-5-5", "high"),
+        "review_fix": [("dsflash", "deepseek", "deepseek-flash", None),
+                       ("sol61", "codex", "gpt-6.1-sol", "high"),
                        ("glm", "glm", None, None),
                        ("swe2", "devin", "swe-2", None)],
-        "re_review": [("glm", "glm", None, None),
+        "re_review": [("devin_auto", "devin", "automatic", None),
+                      ("dsflash", "deepseek", "deepseek-flash", None),
                       ("sol61", "codex", "gpt-6.1-sol", "high"),
-                      ("sonnet", "claude", "claude-sonnet-5-5", "medium"),
                       ("swe2", "devin", "swe-2", None)],
-        "audit": [("fable", "claude", "claude-fable-5-1", "medium"),
-                  ("astra6", "codex", "gpt-6-astra", "high"),
+        "audit": [("astra6", "codex", "gpt-6-astra", "high"),
                   ("glm", "glm", None, None),
                   ("swe2", "devin", "swe-2", None)],
     }
@@ -639,10 +638,9 @@ def test_daemon_stages_and_fallback(tmp_dir):
     c_cmd, c_env = dm.build_lane_command(
         dm.get_stage_chain("design", cfg_path)[0], "/tmp/p.md", "/tmp", "/tmp/o.out", readonly=True
     )
-    check("daemon claude opus55 medium cmd",
-          "--model" in c_cmd and "claude-opus-5-5" in c_cmd and "--effort" in c_cmd and "medium" in c_cmd,
+    check("daemon codex astra6 high readonly cmd",
+          "gpt-6-astra" in c_cmd and 'model_reasoning_effort="high"' in c_cmd and "read-only" in c_cmd,
           str(c_cmd))
-    check("daemon claude config dir", c_env.get("CLAUDE_CONFIG_DIR") == "/home/box/.claude-fable", str(c_env.get("CLAUDE_CONFIG_DIR")))
 
     x_cmd, _ = dm.build_lane_command(
         dm.get_stage_chain("build", cfg_path)[0], "/tmp/p.md", "/tmp", "/tmp/o.out", readonly=False
@@ -659,7 +657,7 @@ def test_daemon_stages_and_fallback(tmp_dir):
     check("daemon glm readonly flags", "--allowedTools" in g_cmd and "Read" in g_cmd, str(g_cmd))
 
     d_cmd, _ = dm.build_lane_command(
-        dm.get_stage_chain("audit", cfg_path)[3], "/tmp/p.md", "/tmp", "/tmp/o.out", readonly=True
+        dm.get_stage_chain("audit", cfg_path)[2], "/tmp/p.md", "/tmp", "/tmp/o.out", readonly=True
     )
     check("daemon devin swe-2 cmd", "--model" in d_cmd and "swe-2" in d_cmd and "auto" in d_cmd, str(d_cmd))
 
@@ -678,7 +676,7 @@ def test_daemon_stages_and_fallback(tmp_dir):
 
     res = dm.run_stage_chain("design", "design task", tmp_dir, tmp_dir, runner=fake_runner, config_path=cfg_path)
     check("daemon fallback stops at 2nd backup (glm)",
-          calls == ["opus55", "astra6", "glm"] and res["choice"]["model"] == "glm" and len(res["skipped"]) == 2,
+          calls == ["astra6", "dsflash", "glm"] and res["choice"]["model"] == "glm" and len(res["skipped"]) == 2,
           f"calls={calls} res={res}")
     check("daemon verdict parse", dm.parse_verdict(res["text"]) == "APPROVE", str(res["text"]))
 
@@ -696,6 +694,17 @@ def test_daemon_stages_and_fallback(tmp_dir):
     check("daemon audit every 10 PRs",
           dm.should_run_audit(10, 0) and dm.should_run_audit(20, 10)
           and not dm.should_run_audit(9, 0) and not dm.should_run_audit(10, 10), "")
+
+
+def test_is_limit_or_unavailable_content():
+    import daemon as dm
+    long = ("Design notes covering a weekly rate limit and quota policy for later stages. " * 12)
+    check("limit: long rc=0 text with rate limit/quota is available",
+          len(long) >= 600 and not dm.is_limit_or_unavailable(0, long), str(len(long)))
+    check("limit: short 429 limit text is unavailable",
+          dm.is_limit_or_unavailable(0, "HTTP 429 rate limit reached"), "")
+    check("limit: rc!=0 is unavailable",
+          dm.is_limit_or_unavailable(1, "ok"), "")
 
 
 def test_config_batch1(tmp_dir):
@@ -2676,6 +2685,7 @@ def main():
         test_status_write(tempfile.mkdtemp(prefix="ab-write-"))
         test_env_and_slack(tempfile.mkdtemp(prefix="ab-env-"))
         test_daemon_stages_and_fallback(tempfile.mkdtemp(prefix="ab-daemon-"))
+        test_is_limit_or_unavailable_content()
         test_config_batch1(tempfile.mkdtemp(prefix="ab-config-"))
         test_metric_retry(tempfile.mkdtemp(prefix="ab-retry-"))
         test_page_reverify(tempfile.mkdtemp(prefix="ab-reverify-"), server)
