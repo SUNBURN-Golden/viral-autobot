@@ -2155,7 +2155,8 @@ def ops_fixture(tmp_dir):
     cfg, conn, proj, now, q, e = batch2_fixture(tmp_dir)
     cfg['ops']['paths'].update(out=os.path.join(tmp_dir, 'out', 'ops'),
                                dryrun_log=os.path.join(tmp_dir, 'logs', 'ops_dryrun.md'),
-                               prompts=os.path.join(ROOT, 'ops', 'prompts'))
+                               prompts=os.path.join(ROOT, 'ops', 'prompts'),
+                               cost_log=os.path.join(tmp_dir, 'logs', 'ops_cost.jsonl'))
     cfg['ops']['accounts']['hanset']['x']['confirmed'] = True
     cfg['metrics']['dir'] = os.path.join(tmp_dir, 'metrics')
     qid = batch2_question(conn, cfg, proj, q, now)
@@ -2215,7 +2216,7 @@ def test_ops_config_batch5(tmp_dir):
     check('ops deep merge preserves overrides', legacy['ops']['model'] == 'custom-model' and legacy['ops']['utm']['campaign'] == 'legacy')
     check('ops defaults independent', cfg['ops']['accounts']['hanset']['x']['confirmed'] is True and legacy['ops']['accounts']['hanset']['x']['confirmed'] is False)
     ops_storage.ensure_ops_schema(conn)
-    check('ops schema idempotent', conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'ops_%'").fetchone()[0] == 6)
+    check('ops schema idempotent', {'ops_runs', 'ops_drafts', 'ops_compliance', 'ops_schedule', 'ops_publish_guides', 'ops_measure_notes', 'ops_packages', 'ops_metric_snapshots'} <= {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")})
     check('ops paths expanduser', ops_config.resolve_path('~/profile') == os.path.expanduser('~/profile'))
     for name in ('pitchboard', 'goallit', 'agamajung'):
         cfg['ops']['brands'][name]['enabled'] = True
@@ -2382,7 +2383,7 @@ def test_ops_schedule_batch5(tmp_dir):
     did = drafts[0]['id']
     before = ops_counts(conn)
     result = ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=[did])
-    check('ops no PASS blocks schedule', result['status'] == 'blocked' and result['results'][0]['reason'] == 'compliance_pass_required')
+    check('ops automatic PASS still requires human approval', result['status'] == 'blocked' and result['results'][0]['reason'] == 'draft_not_approved')
     check('ops blocked scheduling leaves queue unchanged', ops_counts(conn) == before)
     ops_pipeline.cmd_compliance(conn, cfg, proj, now, mock=ops_mock, ops_draft_ids=[did])
     result = ops_pipeline.cmd_schedule(conn, cfg, proj, now, ops_draft_ids=[did])
@@ -2498,7 +2499,8 @@ def test_ops_measure_batch5(tmp_dir):
 
 def test_ops_cli_dryrun_batch5(tmp_dir):
     cfg = make_cfg(tmp_dir)
-    cfg['ops']['paths'].update(out=os.path.join(tmp_dir, 'ops-out'), dryrun_log=os.path.join(tmp_dir, 'ops-dryrun.md'), prompts=os.path.join(ROOT, 'ops', 'prompts'))
+    cfg['ops']['paths'].update(out=os.path.join(tmp_dir, 'ops-out'), dryrun_log=os.path.join(tmp_dir, 'ops-dryrun.md'), prompts=os.path.join(ROOT, 'ops', 'prompts'),
+                               cost_log=os.path.join(tmp_dir, 'logs', 'ops_cost.jsonl'))
     now = ab.now_kst()
     conn = ab.db_connect(cfg)
     ops_storage.ensure_ops_schema(conn)
@@ -2550,7 +2552,7 @@ def test_ops_cli_mock_lifecycle_batch5(tmp_dir):
     check('ops mock CLI draft creates local rows', rc == 0 and len(result['drafts']) == 3, stderr)
     did = result['drafts'][0]['id']
     rc, result, stderr = cli('schedule', '--ops-draft-id', str(did))
-    check('ops mock CLI schedule refuses missing PASS rc2', rc == 2 and result['results'][0]['reason'] == 'compliance_pass_required')
+    check('ops mock CLI schedule requires human approval rc2', rc == 2 and result['results'][0]['reason'] == 'draft_not_approved')
     rc, result, stderr = cli('compliance', '--ops-draft-id', str(did))
     check('ops mock CLI compliance PASS', rc == 0 and result['verdict'] == 'PASS')
     anchor = conn.execute('SELECT id FROM drafts LIMIT 1').fetchone()[0]
@@ -2624,10 +2626,347 @@ def test_ops_source_guards_batch5(tmp_dir):
     calls = [n for _, source in sources for n in ast.walk(ast.parse(source)) if isinstance(n, ast.Call)]
     check('ops does not collect global due checks', not any(isinstance(n.func, ast.Attribute) and n.func.attr == 'run_due_checks' for n in calls))
     source = '\n'.join(s for _, s in sources)
-    check('ops has no browser, payment, git or social SDK calls', all(term not in source for term in ('git push', 'git commit', 'playwright', 'selenium', 'stripe', 'tweepy', 'urlopen(')))
+    check('ops network restricted to X adapter', all('urllib.request' not in s and 'urlopen(' not in s for name, s in sources if name != 'x_public.py'))
+    check('ops has no browser, payment, git or social SDK calls', all(term not in source for term in ('git push', 'git commit', 'playwright', 'selenium', 'stripe', 'tweepy')))
     check('ops package init empty', os.path.getsize(os.path.join(ROOT, 'ops', '__init__.py')) == 0)
     for name in ('config.py', 'guards.py', 'storage.py', 'mocks.py'):
         check('ops independent module ' + name, 'import autobot' not in dict(sources)[name])
+
+
+def live_ops_fixture(tmp_dir):
+    cfg, conn, proj, now, qid, eid = ops_fixture(tmp_dir)
+    for key, value in dict(daily_packages='daily', history_json='history.json', manual_metrics='manual',
+                           strategy_next='strategy-next.md', strategies='strategies.md',
+                           weekly_plan_glob='hanset-weekly-plan-*.md', cost_log='ops_cost.jsonl').items():
+        cfg['ops']['paths'][key] = os.path.join(tmp_dir, value)
+    with open(cfg['ops']['paths']['history_json'], 'w') as stream: json.dump([], stream)
+    with open(cfg['ops']['paths']['strategies'], 'w') as stream: stream.write('HANSET 체크리스트\nKitchen Genome hold')
+    cfg['paths']['rounds_log'] = os.path.join(tmp_dir, 'rounds.log')
+    cfg['paths']['status_md'] = os.path.join(tmp_dir, 'status.md')
+    with open(cfg['paths']['rounds_log'], 'w') as stream: stream.write('')
+    return cfg, conn, proj, now
+
+
+def test_ops_package_batch6(tmp_dir):
+    import copy
+    import glob
+    from ops import packet, package
+    cfg, conn, proj, now = live_ops_fixture(tmp_dir)
+    source = os.path.join(HERE, 'fixtures', 'factcheck-1108.md')
+    with open(source) as stream: raw = stream.read()
+    parsed = packet.parse_packet(raw, '1108')
+    check('b6 explicit separate packet dates/id', (parsed['id'], parsed['package_date'], parsed['checked'], parsed['checked_phrase']) ==
+          ('2026-11-08_kintex_getting_there', '2026-11-08', '2026-11-07', 'checked Nov 7'))
+    corpus = '\n'.join(f['text'] for f in parsed['facts'])
+    check('b6 nested buses with source provenance', any('9703' in f['text'] and f['sources'] and 'transportation' in f['sources'][0] for f in parsed['facts']))
+    check('b6 packet excludes reference/correction', all(t not in corpus for t in ('EPIC SEOUL', '17:50', '18:40', 'Do not invent', 'do not say')))
+    check('b6 card hint D-5 preserved', any('D-5' in f['text'] for f in parsed['facts']))
+    check('b6 original positions and sections retained', all(f['line'] > 0 and f['section'] for f in parsed['facts']) and bool(parsed['drafts']))
+    for label, text, date in [('year', raw.replace('2026-11-07', '11-07').replace('2026-11-08', '11-08'), '1108'),
+                              ('date mismatch', raw, '1109'), ('invalid day', raw, '0231'),
+                              ('content traversal', raw.replace('1108_kintex_getting_there', '../evil'), '1108'),
+                              ('checked conflict', raw+'\nchecked Nov 8', '1108')]:
+        try: packet.parse_packet(text, date)
+        except ops_guards.OpsError: check('b6 packet rejects '+label, True)
+        else: check('b6 packet rejects '+label, False)
+    payload = dict(packet=parsed, motifs=list(package.MOTIFS), palettes=list(package.PALETTES))
+    response = package.mock_package(payload)
+    check('b6 mock obeys all final guards', package.validate(response, parsed, [], cfg, proj) == [])
+    for path in ('post.title', 'post.subtitle', 'post.cover.kicker', 'post.summary.0', 'post.sources.0', 'post.items.0.price', 'post.cta', 'post.label', 'post.footer', 'x', 'threads', 'ig_caption', 'reddit'):
+        for injection in (' 999999원', ' RUNPORT', ' test@example.org', ' 010 - 1234 - 5678'):
+            bad = copy.deepcopy(response); node = bad
+            keys = path.split('.')
+            for k in keys[:-1]: node = node[int(k)] if isinstance(node, list) else node[k]
+            key = int(keys[-1]) if isinstance(node, list) else keys[-1]
+            node[key] += injection
+            check('b6 all visible guards '+path+injection, bool(package.validate(bad, parsed, [], cfg, proj)))
+    for text in ('Entry fee ₩3,720 per hour', 'Race starts 05:00–23:00', 'HYROX is in Hall 2'):
+        bad = copy.deepcopy(response); bad['post']['title'] = text; bad['claim_refs']['post.title'] = [f['fact_id'] for f in parsed['facts']]
+        check('b6 semantic reassignment blocked '+text, bool(package.validate(bad, parsed, [], cfg, proj)))
+    bus = next(f for f in parsed['facts'] if f['text'].startswith('9703'))
+    bad = copy.deepcopy(response); bad['post']['items'][0]['memo'] = bus['text']; bad['claim_refs']['post.items.0.memo'] = [bus['fact_id']]
+    check('b6 official Hall 2 bus stop allowed', package.validate(bad, parsed, [], cfg, proj) == [])
+    # A URL that is part of an allowed fact is packet-sourced, not hallucinated.
+    url_fact = next(f for f in parsed['facts'] if 'https://www.kintex.com/' in f['text'])
+    bad = copy.deepcopy(response); bad['post']['items'][0]['memo'] = url_fact['text']
+    bad['claim_refs']['post.items.0.memo'] = [url_fact['fact_id']]
+    check('b6 fact-embedded URL allowed', package.validate(bad, parsed, [], cfg, proj) == [])
+    # Contentless output cannot pass: empty presentation text or a channel with
+    # no referenced fact is rejected.
+    empty = copy.deepcopy(response); empty['post']['title'] = ''
+    try: package.validate(empty, parsed, [], cfg, proj)
+    except ops_guards.OpsError: check('b6 empty title rejected', True)
+    else: check('b6 empty title rejected', False)
+    empty = copy.deepcopy(response); empty['post']['summary'][0] = '  '
+    try: package.validate(empty, parsed, [], cfg, proj)
+    except ops_guards.OpsError: check('b6 empty summary rejected', True)
+    else: check('b6 empty summary rejected', False)
+    empty = copy.deepcopy(response); empty['post']['items'][0].update(area='', price='', memo='')
+    try: package.validate(empty, parsed, [], cfg, proj)
+    except ops_guards.OpsError: check('b6 contentless item rejected', True)
+    else: check('b6 contentless item rejected', False)
+    empty = copy.deepcopy(response); empty['claim_refs'].pop('x')
+    check('b6 channel without fact rejected', 'package_claim_refs' in package.validate(empty, parsed, [], cfg, proj))
+    for path, value in [('seed', True), ('layout', 'oops'), ('palette', 'unknown')]:
+        bad = copy.deepcopy(response); bad['post']['cover'][path] = value
+        try: package.validate(bad, parsed, [], cfg, proj)
+        except ops_guards.OpsError: check('b6 schema cover '+path, True)
+        else: check('b6 schema cover '+path, False)
+    for key, value in [('items_per_slide', True), ('items_per_slide', 0), ('id', '../oops'), ('uninspected', 'hidden')]:
+        bad = copy.deepcopy(response); bad['post'][key] = value
+        try: package.validate(bad, parsed, [], cfg, proj)
+        except ops_guards.OpsError: check('b6 schema '+key+str(value), True)
+        else: check('b6 schema '+key+str(value), False)
+    for suffix in ('&utm_campaign=wrong', '&utm_content=evil'):
+        bad = copy.deepcopy(response); bad['x'] += suffix
+        check('b6 UTM duplicates blocked '+suffix, 'package_utm' in package.validate(bad, parsed, [], cfg, proj))
+    bad = copy.deepcopy(response); bad['ig_caption'] += '\nhanset.soulbound.co.kr'
+    check('b6 IG bare domain forbidden', 'package_ig_link' in package.validate(bad, parsed, [], cfg, proj))
+    check('b6 fixed weighted boundaries', ops_guards.x_weighted_length('a'*280) == 280 and ops_guards.x_weighted_length('a'*281) == 281 and ops_guards.x_weighted_length('₩한😀') == 6)
+    cfg['ops']['limits'].update(url_weight=1, wide_char_weight=1, x_weighted=999, threads_chars=999)
+    bad = copy.deepcopy(response); bad['x'] = 'HANSET'*47+'\n'+parsed['checked_phrase']+'\n'+response['x'].splitlines()[-1]
+    check('b6 package cannot relax X weights via config', 'x_length_exceeded' in package.validate(bad, parsed, [], cfg, proj))
+    bad = copy.deepcopy(response)
+    bad['threads'] = ' ' * (500 - len(bad['threads'])) + bad['threads']
+    check('b6 final Threads 500 allowed', package.validate(bad, parsed, [], cfg, proj) == [])
+    bad['threads'] = ' ' + bad['threads']
+    check('b6 final Threads 501 blocked', 'threads_length_exceeded' in package.validate(bad, parsed, [], cfg, proj))
+    seeded = copy.deepcopy(response); del seeded['post']['cover']['seed']
+    check('b6 code default seed', package.validate(seeded, parsed, [], cfg, proj) == [] and type(seeded['post']['cover']['seed']) is int)
+    hist = [dict(id='other', motif=response['post']['cover']['motif'], palette='clay')]
+    check('b6 motif alone dedup', 'cover_duplicate' in package.validate(response, parsed, hist, cfg, proj))
+    hist = [dict(id='other', motif='legacy', palette='unknown', bg=package.PALETTES[response['post']['cover']['palette']])]
+    check('b6 background alone dedup', 'cover_duplicate' in package.validate(response, parsed, hist, cfg, proj))
+    with open(cfg['ops']['paths']['history_json'], 'w') as stream:
+        json.dump([dict(id=str(i), motif='legacy', palette='sky') for i in range(7)] + [dict(id=parsed['id'], motif='ticket', palette='mint')], stream)
+    check('b6 exclude same id BEFORE last six', [e['id'] for e in package.history(cfg, parsed['id'])] == [str(i) for i in range(1, 7)])
+    with open(cfg['ops']['paths']['history_json'], 'w') as stream: stream.write('broken')
+    ops_expect_block('b6 malformed history fail closed', lambda: package.history(cfg, parsed['id']), 'cover_history_invalid')
+    with open(cfg['ops']['paths']['history_json'], 'w') as stream: json.dump([], stream)
+    target = os.path.join(tmp_dir, 'success')
+    result = ops_pipeline.cmd_package(conn, cfg, proj, now, packet=source, date='1108', out_dir=target, mock=ops_mock)
+    check('b6 package end to end PASS', result['status'] == 'ok', result)
+    check('b6 complete render contract files', set(os.listdir(target)) == {'post.json', 'x.txt', 'threads.txt', 'ig_caption.txt', 'reddit.md', 'cards'})
+    check('b6 no render output', os.listdir(os.path.join(target, 'cards')) == [])
+    check('b6 package linked to audit run', conn.execute('SELECT run_id,compliance_verdict FROM ops_packages').fetchone()['compliance_verdict'] == 'PASS')
+    result = ops_pipeline.cmd_package(conn, cfg, proj, now, packet=source, date='1108',
+                                      out_dir=os.path.join(tmp_dir, 'schema-block'), mock={'package': {'post': {}}})
+    row = conn.execute('SELECT compliance_verdict,status FROM ops_packages ORDER BY id DESC LIMIT 1').fetchone()
+    check('b6 non-compliance block marked skipped',
+          result['status'] == 'blocked' and row['compliance_verdict'] == 'SKIPPED' and row['status'] == 'blocked')
+    ops_expect_block('b6 existing output preserved', lambda: ops_pipeline.cmd_package(conn, cfg, proj, now, packet=source, date='1108', out_dir=target, mock=ops_mock), 'output_exists')
+    # Length-only failures may retry; forbidden content must never retry.
+    long = copy.deepcopy(response); fact = min((f for f in parsed['facts'] if f['subject'] != 'card hint' and not ops_guards.URL.search(f['text'])), key=lambda f: len(f['text']))
+    long['x'] = (fact['text']+'\n')*5+parsed['checked_phrase']+'\n'+response['x'].splitlines()[-1]
+    fixtures = {'package': [long, response], 'compliance': ops_mock('compliance', {})}
+    result = ops_pipeline.cmd_package(conn, cfg, proj, now, packet=source, date='1108', out_dir=os.path.join(tmp_dir, 'retry'), mock=fixtures)
+    check('b6 shortening retry succeeds', result['status'] == 'ok' and fixtures['package'] == [], result)
+    forbidden = copy.deepcopy(response); forbidden['x'] += ' RUNPORT'
+    fixtures = {'package': [forbidden, response]}
+    result = ops_pipeline.cmd_package(conn, cfg, proj, now, packet=source, date='1108', out_dir=os.path.join(tmp_dir, 'forbidden'), mock=fixtures)
+    check('b6 forbidden never retries', result['status'] == 'blocked' and len(fixtures['package']) == 1)
+    duplicate = copy.deepcopy(response); duplicate['post']['cover']['motif'] = 'ticket'
+    with open(cfg['ops']['paths']['history_json'], 'w') as stream: json.dump([dict(id='old', motif='ticket', palette='clay')], stream)
+    fresh = copy.deepcopy(response); fresh['post']['cover']['motif'] = 'tattoo'
+    fixtures = {'package': [duplicate, fresh], 'compliance': ops_mock('compliance', {})}
+    result = ops_pipeline.cmd_package(conn, cfg, proj, now, packet=source, date='1108', out_dir=os.path.join(tmp_dir, 'cover-retry'), mock=fixtures)
+    check('b6 cover retry succeeds', result['status'] == 'ok' and not fixtures['package'], result)
+    with open(cfg['ops']['paths']['history_json'], 'w') as stream: json.dump([], stream)
+    fixtures = {'package': [copy.deepcopy(long) for _ in range(4)]}
+    blocked_target = os.path.join(tmp_dir, 'blocked')
+    result = ops_pipeline.cmd_package(conn, cfg, proj, now, packet=source, date='1108', out_dir=blocked_target, mock=fixtures)
+    check('b6 exactly four attempts and no partial publication', result['status'] == 'blocked' and not fixtures['package'] and not os.path.exists(blocked_target) and not glob.glob(blocked_target+'*.partial'))
+    check('b6 blocked report only reason/check/hash', set(json.load(open(os.path.join(result['output_dir'], 'COMPLIANCE_FAIL.json')))) == {'reasons', 'checks', 'packet_hash'})
+    result = ops_pipeline.cmd_package(conn, cfg, proj, now, packet=source, date='1108', out_dir=blocked_target, mock=ops_mock)
+    check('b6 blocked date can be retried', result['status'] == 'ok')
+    fail = ops_mock('compliance', {}); fail['checks']['C2']['pass'] = False
+    cfg['ops']['compliance']['block_on_fail'] = False
+    result = ops_pipeline.cmd_package(conn, cfg, proj, now, packet=source, date='1108', out_dir=os.path.join(tmp_dir, 'fail'), mock={'package': response, 'compliance': fail})
+    check('b6 package compliance mandatory', result['status'] == 'blocked' and not os.path.exists(os.path.join(tmp_dir, 'fail')))
+    before = conn.execute('SELECT count(*) FROM ops_packages').fetchone()[0]
+    result = ops_pipeline.cmd_package(conn, cfg, proj, now, packet=source, date='1108', dry_run=True)
+    check('b6 package preview isolated and no business writes', result['status'] == 'ok' and '/previews/' in result['output_dir'] and not os.path.exists(cfg['ops']['paths']['daily_packages']) and conn.execute('SELECT count(*) FROM ops_packages').fetchone()[0] == before)
+    check('b6 dryrun/mock have no cost log', not os.path.exists(cfg['ops']['paths']['cost_log']))
+    # Draft also cannot bypass automatic compliance, even with block_on_fail false.
+    def fail_draft(command, data): return fail if command == 'compliance' else ops_mock(command, data)
+    result = ops_pipeline.cmd_draft(conn, cfg, proj, now, mock=fail_draft)
+    check('b6 draft mandatory compliance', result['status'] == 'blocked' and all(d['status'] == 'blocked' for d in result['drafts']))
+    conn.close()
+
+
+def test_ops_live_packets_batch6(tmp_dir):
+    import re
+    from ops import packet
+    cfg, conn, proj, now = live_ops_fixture(tmp_dir)
+    for mmdd, content in (('1109', '1109_hyrox_d4'), ('1110', '1110_race_prep_checklist')):
+        source = os.path.join(HERE, 'fixtures', f'factcheck-{mmdd}.md')
+        with open(source) as stream: raw = stream.read()
+        parsed = packet.parse_packet(raw, mmdd)
+        check(f'b6 {mmdd} live packet ready', parsed['id'].endswith(content[5:]) and parsed['checked'] and parsed['facts'])
+        check(f'b6 {mmdd} landing from packet', parsed['landing'] == 'https://hanset.soulbound.co.kr/')
+        check(f'b6 {mmdd} official source carried',
+              any('hyrox.com/event/hyrox-seoul' in url for url in parsed['sources']))
+        check(f'b6 {mmdd} UTM content from packet', parsed['content'] == content)
+        corpus = '\n'.join(f['text'] for f in parsed['facts'])
+        check(f'b6 {mmdd} no refund claim in allowed facts', not re.search(r'refund|환불', corpus, re.I))
+        if mmdd == '1109':
+            check('b6 1109 name-change fact retained', 'Lite Flex' in corpus)
+            check('b6 1109 refund class forbidden', {'환불', 'refund'} <= set(parsed['forbidden']))
+        else:
+            check('b6 1110 refund directive forbidden', {'환불', 'refund'} <= set(parsed['forbidden']))
+        target = os.path.join(tmp_dir, 'daily-' + mmdd)
+        result = ops_pipeline.cmd_package(conn, cfg, proj, now, packet=source, date=mmdd, out_dir=target, mock=ops_mock)
+        check(f'b6 {mmdd} end to end package', result['status'] == 'ok' and os.path.isdir(target), result)
+        check(f'b6 {mmdd} render contract files',
+              set(os.listdir(target)) == {'post.json', 'x.txt', 'threads.txt', 'ig_caption.txt', 'reddit.md', 'cards'})
+        with open(os.path.join(target, 'post.json')) as stream: post = json.load(stream)
+        check(f'b6 {mmdd} post identity and checked', post['id'] == parsed['id'] and post['checked'] == parsed['checked'])
+    conn.close()
+
+
+def test_ops_metrics_strategy_batch6(tmp_dir):
+    import copy
+    from ops import metrics, x_public, strategy
+    cfg, conn, proj, now = live_ops_fixture(tmp_dir)
+    pid = batch4_post(conn, now-timedelta(days=8), 'manual-b6', channel='instagram')
+    url = 'https://www.instagram.com/p/example/'
+    conn.execute('UPDATE published SET url=? WHERE post_id=?', (url, pid)); conn.commit()
+    path = os.path.join(cfg['ops']['paths']['manual_metrics'], pid+'_48h.json'); os.makedirs(os.path.dirname(path))
+    manual = dict(post_id=pid, check_kind='48h', channel='instagram', public_url=url, observed_at=ab.iso(now), metrics=dict(likes=3, replies=0, reposts=0))
+    def write(value):
+        with open(path, 'w') as stream: json.dump(value, stream)
+    write(manual)
+    result = ops_pipeline.cmd_measure(conn, cfg, proj, now, post_id=pid, check_kind='48h', mock=ops_mock)
+    check('b6 manual collects canonical zero metrics', result['status'] == 'ok' and conn.execute("SELECT count(*) FROM metric_observations WHERE metric IN ('replies','reposts') AND value=0").fetchone()[0] == 2)
+    check('b6 unknown is not numeric observation', conn.execute("SELECT count(*) FROM metric_observations WHERE metric='views'").fetchone()[0] == 0 and result['snapshots'][0]['metrics']['views'] == 'unverified')
+    check('b6 measure note snapshot linked', conn.execute('SELECT snapshot_id FROM ops_measure_notes').fetchone()[0] == result['snapshots'][0]['snapshot_id'])
+    count = conn.execute('SELECT count(*) FROM ops_metric_snapshots').fetchone()[0]
+    ops_pipeline.cmd_measure(conn, cfg, proj, now+timedelta(minutes=1), post_id=pid, check_kind='48h', mock=ops_mock)
+    check('b6 same manual snapshot dedup ignores collection time', conn.execute('SELECT count(*) FROM ops_metric_snapshots').fetchone()[0] == count)
+    post = conn.execute('SELECT * FROM published WHERE post_id=?', (pid,)).fetchone()
+    for key, value in [('post_id','other'),('channel','threads'),('public_url','https://evil.invalid/p/a'),('check_kind','7d'),('observed_at',ab.iso(now+timedelta(seconds=1))),('observed_at',ab.iso(now-timedelta(days=8))),('observed_at','2026-11-09T00:00:00'),('project','other')]:
+        bad = copy.deepcopy(manual); bad[key] = value; write(bad)
+        try: metrics.snapshot(post, '48h', cfg, now, mock=ops_mock)
+        except ops_guards.OpsError: check('b6 manual identity/time '+key+str(value), True)
+        else: check('b6 manual identity/time '+key+str(value), False)
+    for bad_metrics in ({'comments':0}, {'likes':True}, {'likes':-1}, {'likes':1.5}, {'likes':None}):
+        bad = dict(manual, metrics=bad_metrics); write(bad)
+        ops_expect_block('b6 invalid metric '+str(bad_metrics), lambda: metrics.snapshot(post, '48h', cfg, now, mock=ops_mock), 'manual_metrics_invalid')
+    write(manual)
+    for field in ('hypothesis','actual_with_denominator','alternative_causes','next_single_change'):
+        def fabricate(command, data, field=field):
+            value = ops_mock(command, data); value[field] = ['views 999'] if field == 'alternative_causes' else 'views 999'; return value
+        ops_expect_block('b6 fabricated measure '+field, lambda: ops_pipeline.cmd_measure(conn, cfg, proj, now, post_id=pid, check_kind='48h', mock=fabricate), 'measure_fabricated_number')
+    check('b6 blocked LLM preserves raw snapshot', conn.execute('SELECT count(*) FROM ops_metric_snapshots').fetchone()[0] == count)
+    altered = ops_mock('measure', dict(hypothesis='가설', actual_with_denominator='likes 3', alternative_causes=['관측 부족']))
+    altered['actual_with_denominator'] = 'views 3'
+    ops_expect_block('b6 same number wrong metric blocked', lambda: metrics.validate_note(altered, 'likes 3'), 'measure_fabricated_number')
+    os.unlink(path)
+    result = ops_pipeline.cmd_measure(conn, cfg, proj, now, post_id=pid, check_kind='7d', mock=ops_mock)
+    check('b6 missing manual file becomes all unknown', set(result['snapshots'][0]['metrics'].values()) == {'unverified'} and result['notes'][0]['verdict'] == '판정 보류')
+    before = ops_counts(conn); snapshots_before = conn.execute('SELECT count(*) FROM ops_metric_snapshots').fetchone()[0]
+    ops_pipeline.cmd_measure(conn, cfg, proj, now, post_id=pid, check_kind='48h', dry_run=True)
+    check('b6 measure dryrun read only', before == ops_counts(conn) and conn.execute('SELECT count(*) FROM ops_metric_snapshots').fetchone()[0] == snapshots_before)
+    # Fixed-host read-only X adapter, with a fake transport for every enabled path.
+    cfg['ops']['measure']['x_public'] = True
+    xurl = 'https://x.com/hanset_mag/status/12345'
+    class Response(io.BytesIO):
+        status=200
+        def geturl(self): return 'https://api.x.com/2/tweets/12345?tweet.fields=public_metrics'
+    requests=[]
+    def transport(request, timeout):
+        requests.append(request)
+        return Response(json.dumps({'data':{'id':'12345','public_metrics':{'like_count':3,'reply_count':0,'retweet_count':0}}}).encode())
+    with patch.dict(os.environ, {'X_BEARER_TOKEN':'x-private-credential'}):
+        check('b6 live X maps canonical metrics', x_public.collect(xurl, cfg, transport=transport) == dict(likes=3,replies=0,reposts=0,views='unverified'))
+        check('b6 X only fixed HTTPS GET', requests[0].method == 'GET' and requests[0].full_url.startswith('https://api.x.com/2/tweets/'))
+        for kwargs in ({'dry_run':True},{'mock':{}},{'mock':ops_mock}):
+            check('b6 mock/dry X no network '+str(kwargs), set(x_public.collect(xurl,cfg,transport=lambda *a,**k: (_ for _ in ()).throw(AssertionError()),**kwargs).values()) == {'unverified'})
+        for bad_url in ('http://x.com/a/status/12345','https://evil.test/a/status/12345','https://x.com/a/status/notnumber'):
+            check('b6 X URL validation '+bad_url, set(x_public.collect(bad_url,cfg,transport=transport).values()) == {'unverified'})
+        def error(*args, **kwargs): raise ValueError('x-private-credential')
+        check('b6 X failure unknown', set(x_public.collect(xurl,cfg,transport=error).values()) == {'unverified'})
+        cfg['ops']['measure']['x_public'] = False
+        check('b6 X disabled never calls transport', set(x_public.collect(xurl,cfg,transport=error).values()) == {'unverified'})
+        check('b6 X credential redacted', 'x-private-credential' not in ops_guards.redact('x-private-credential'))
+    class Redirect(Response):
+        def geturl(self): return 'https://evil.test/'
+    cfg['ops']['measure']['x_public'] = True
+    with patch.dict(os.environ, {'X_BEARER_TOKEN':'opaque'}):
+        check('b6 X rejects redirects', set(x_public.collect(xurl,cfg,transport=lambda *a,**k: Redirect(b'{}')).values()) == {'unverified'})
+        check('b6 X identity error unknown', set(x_public.collect(xurl,cfg,transport=lambda *a,**k: Response(b'{"data":{"id":"other","public_metrics":{}}}')).values()) == {'unverified'})
+    check('b6 X redirect handler refuses', x_public.NoRedirect().redirect_request(None,None,302,'',{},'https://evil') is None)
+    result = ops_pipeline.cmd_plan(conn, cfg, proj, now, mode='next-week', mock=ops_mock)
+    check('b6 strategy unknown forced defer', result['status'] == 'ok' and all(i['action']=='defer' for i in result['recommendations']) and '판정 보류' in open(result['path']).read())
+    # Create independent verified snapshot evidence for keep/kill/iterate.
+    original = metrics.snapshot(post, '48h', cfg, now, mock=ops_mock)
+    original.update(source='manual', observed_at=ab.iso(now), metrics=dict(likes=3,replies=0,reposts=0,views=50))
+    strategy_sid = metrics.save_snapshot(conn, original, now)
+    conn.execute("UPDATE ops_measure_notes SET snapshot_id=?,verdict='pass',category=NULL WHERE post_id=? AND check_kind='48h'", (strategy_sid, pid))
+    conn.execute("UPDATE diagnoses SET verdict='pass',category=NULL WHERE post_id=? AND check_kind='48h'", (pid,)); conn.commit()
+    ctx = strategy.build_context(conn,cfg,proj,now)
+    keep_ref = next(k for k,v in ctx['evidence'].items() if v['verdict']=='pass')
+    recommendations = [dict(topic='HANSET',format='카드',action='keep',evidence_refs=[keep_ref],reason='검증된 진단에 따라 유지',template_hint='훅: 질문형; 카드: 기존 구성; 채널: x, threads, instagram')]
+    result = ops_pipeline.cmd_plan(conn,cfg,proj,now,mode='next-week',mock={'plan_next':{'recommendations':recommendations}})
+    check('b6 strategy supported keep and metrics output', result['recommendations'][0]['action']=='keep' and '"views": 50' in open(result['path']).read())
+    relaxed = dict(recommendations[0], format='카드뉴스', reason='근거 확인 후 유지',
+                   template_hint='훅: 재사용; 카드: 요약 장수; 채널: x, threads')
+    result = ops_pipeline.cmd_plan(conn,cfg,proj,now,mode='next-week',mock={'plan_next':{'recommendations':[relaxed]}})
+    check('b6 strategy live phrasing accepted', result['recommendations'][0]['action']=='keep')
+    conn.execute("UPDATE diagnoses SET verdict='diagnosed',category='low_impressions' WHERE post_id=? AND check_kind='48h'",(pid,))
+    conn.execute("UPDATE ops_measure_notes SET verdict='diagnosed',category='low_impressions' WHERE snapshot_id=?", (strategy_sid,)); conn.commit()
+    for action in ('kill','iterate'):
+        recommendation = dict(recommendations[0],action=action,reason='검증된 진단에 따라 종료' if action=='kill' else '검증된 진단에 따라 개선',template_hint='retire: 검증된 실패 진단' if action=='kill' else '단일 변수 개선')
+        result = ops_pipeline.cmd_plan(conn,cfg,proj,now,mode='next-week',mock={'plan_next':{'recommendations':[recommendation]}})
+        check('b6 strategy supported '+action, result['recommendations'][0]['action']==action)
+    bad = dict(recommendations[0],reason='likes 999')
+    ops_expect_block('b6 strategy invented numbers',lambda:ops_pipeline.cmd_plan(conn,cfg,proj,now,mode='next-week',mock={'plan_next':{'recommendations':[bad]}}),'strategy_fabricated_number')
+    held = dict(recommendations[0],topic='KitchenGenome')
+    result=ops_pipeline.cmd_plan(conn,cfg,proj,now,mode='next-week',mock={'plan_next':{'recommendations':[held]}})
+    check('b6 KG hold omitted from recommendation', result['recommendations']==[])
+    operational = open(cfg['ops']['paths']['strategy_next']).read()
+    result=ops_pipeline.cmd_plan(conn,cfg,proj,now,mode='next-week',dry_run=True)
+    check('b6 next-week dryrun preview isolated', '/previews/' in result['path'] and open(cfg['ops']['paths']['strategy_next']).read()==operational)
+    # Selection follows packet dates, never mtime.
+    for name,text in [('hanset-weekly-plan-1101.md','2026-11-01 old'),('hanset-weekly-plan-1108.md','2026-11-08 HANSET')]:
+        with open(os.path.join(tmp_dir,name),'w') as stream:stream.write(text)
+    plan_now = datetime(2026,11,10,tzinfo=now.tzinfo)
+    check('b6 weekly plan chooses filename/body date', '2026-11-08' in strategy.weekly_plan(cfg,plan_now))
+    with open(os.path.join(tmp_dir,'hanset-weekly-plan-1108.md'),'w') as stream:
+        stream.write('# HANSET 주간 소셜 플랜 (11/8 ~ 11/14)\n작성: 2026-11-06 KST\nHANSET')
+    check('b6 weekly authored date distinct from start', '2026-11-06' in strategy.weekly_plan(cfg,plan_now))
+    with open(os.path.join(tmp_dir,'hanset-weekly-plan-1108.md'),'w') as stream:stream.write('2026-11-09 conflict')
+    ops_expect_block('b6 weekly date conflict',lambda:strategy.weekly_plan(cfg,plan_now),'weekly_plan_date_conflict')
+    with open(os.path.join(tmp_dir,'hanset-weekly-plan-1108.md'),'w') as stream:
+        stream.write('# HANSET 주간 플랜 (2026-11-08 ~ 2026-11-14)\n작성: 2026-11-08\nHANSET\n')
+    check('b6 weekly same-week date range accepted', '2026-11-08' in strategy.weekly_plan(cfg,plan_now))
+    # Both round header formats accepted, without changing the queue identity.
+    entries=ab.parse_rounds_log('=== 2026-11-01 19:00 KST HANSET ===\n- HANSET posted '+url,cfg['_projects'])
+    check('b6 real rounds header timestamp', entries and entries[0][3].year==2026 and entries[0][3].day==1)
+    conn.close()
+
+
+def test_ops_cost_cli_batch6(tmp_dir):
+    import subprocess
+    from ops import cli
+    cfg,conn,proj,now=live_ops_fixture(tmp_dir)
+    with patch.dict(os.environ, {'DEEPSEEK_API_KEY':'opaque-b6-secret'}):
+        for outcome in (subprocess.CompletedProcess([],0,'{"plan":"ok"}',''),subprocess.CompletedProcess([],0,'invalid',''),subprocess.TimeoutExpired('cli',1)):
+            try:
+                with patch.object(ops_runner.subprocess,'run',side_effect=outcome if isinstance(outcome,Exception) else None,return_value=outcome):
+                    ops_runner.generate('plan',{'text':'opaque-b6-secret'},cfg)
+            except ops_guards.OpsError:pass
+    records=[json.loads(line) for line in open(cfg['ops']['paths']['cost_log'])]
+    check('b6 one cost line per attempted live call',len(records)==3)
+    check('b6 minimal cost fields and no credentials', all(set(r)=={'model','command','input_tokens_est','output_tokens_est','latency_ms'} for r in records) and 'opaque-b6-secret' not in open(cfg['ops']['paths']['cost_log']).read() and records[-1]['output_tokens_est'] is None)
+    source=os.path.join(HERE,'fixtures','factcheck-1108.md')
+    rc,out,err=ops_cli(cfg,now,'package','--packet',source,'--date','1108','--dry-run')
+    check('b6 package CLI wired',rc==0 and json.loads(out)['status']=='ok',out+err)
+    rc,out,err=ops_cli(cfg,now,'plan','--mode','next-week','--dry-run')
+    check('b6 strategy CLI wired',rc==0 and json.loads(out)['status']=='ok',out+err)
+    audit=conn.execute('SELECT prompt_path FROM ops_runs ORDER BY id DESC LIMIT 1').fetchone()[0]
+    check('b6 next-week prompt audit correct', audit.endswith('plan_next.md'))
+    conn.close()
 
 
 def main():
@@ -2645,6 +2984,8 @@ def main():
     urllib.request.urlopen = local_urlopen
     server = start_server()
     try:
+        for test in (test_ops_package_batch6, test_ops_live_packets_batch6, test_ops_metrics_strategy_batch6, test_ops_cost_cli_batch6):
+            test(tempfile.mkdtemp(prefix='ab-batch6-'))
         for test in (test_ops_cli_mock_lifecycle_batch5, test_ops_config_batch5, test_ops_guards_batch5, test_ops_plan_batch5,
                      test_ops_draft_batch5, test_ops_compliance_batch5, test_ops_schedule_batch5,
                      test_ops_publish_guide_batch5, test_ops_measure_batch5, test_ops_cli_dryrun_batch5,

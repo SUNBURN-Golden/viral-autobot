@@ -248,7 +248,7 @@ python3 autobot.py rules rollback --project hanset --key hook_type --reason '후
 | 동작 | `--dry-run` | `--mock-file PATH` | 기본 live |
 | --- | --- | --- | --- |
 | LLM | 결정적 로컬 응답 | JSON fixture 응답 | DeepSeek CLI |
-| 외부 네트워크 | 없음 | 없음 | DeepSeek만 |
+| 외부 네트워크 | 없음 | 없음 | DeepSeek 및 명시 설정 시 X 공개 metrics GET |
 | 비즈니스 원장 쓰기 | 없음 | 허용 | 허용 |
 | `ops_runs` 감사 행 | 씀 | 씀 | 씀 |
 | `logs/ops_dryrun.md` | append | append | 안 씀 |
@@ -265,7 +265,7 @@ python3 autobot.py ops publish-guide --ops-schedule-id 1 --dry-run
 python3 autobot.py ops measure --project hanset --dry-run
 ```
 
-실제 로컬 초안을 만들려면 dry-run을 제거합니다. `plan`은 rounds.log/status.md와 DB를 읽어 `out/ops/plan/`에 1페이지 계획을 씁니다. `draft`는 ready/drafted 질문에 연결된 활성 evidence만 사용하며 X 가중 280자(URL=23, 한글·₩·이모지=2), Threads 500자, Instagram 카드 카피를 검사합니다. 숫자·가격·시간은 evidence corpus에 있어야 합니다. `--draft-id`로 기존 질문 앵커를 선택할 수 있습니다. `ops-draft-id`와 `ops-schedule-id`는 반복 가능합니다. 지정하지 않은 compliance/schedule은 최신 초안을 선택합니다. Instagram 실제 카드 파일은 사람이 준비하고 `ops_drafts.card_path`에 연결해야 가이드를 만들 수 있습니다.
+실제 로컬 초안을 만들려면 dry-run을 제거합니다. `plan`은 rounds.log/status.md와 DB를 읽어 `out/ops/plan/`에 1페이지 계획을 씁니다(dry-run은 `out/ops/previews/<run_id>/plan.md`). `draft`는 ready/drafted 질문에 연결된 활성 evidence만 사용하며 X 가중 280자(URL=23, 한글·₩·이모지=2), Threads 500자, Instagram 카드 카피를 검사합니다. 숫자·가격·시간은 evidence corpus에 있어야 합니다. `--draft-id`로 기존 질문 앵커를 선택할 수 있습니다. `ops-draft-id`와 `ops-schedule-id`는 반복 가능합니다. 지정하지 않은 compliance/schedule은 최신 초안을 선택합니다. Instagram 실제 카드 파일은 사람이 준비하고 `ops_drafts.card_path`에 연결해야 가이드를 만들 수 있습니다.
 
 `compliance`는 한국 표시광고법·공정위 추천·보증 지침·플랫폼 규칙·커뮤니티 홍보 금지를 C1–C15 체크리스트로 검사합니다. 모든 항목에 명시적 boolean `pass=true`가 필요하며 누락·불확실·코드 검사 실패는 FAIL입니다. FAIL이면 schedule/publish-guide를 거부합니다. PASS는 현재 copy와 card_copy의 composite hash에만 유효합니다. 법률·플랫폼 규칙의 최신성 및 증빙은 담당자가 검토하고 evidence와 템플릿을 갱신해야 합니다.
 
@@ -280,7 +280,7 @@ python3 autobot.py metrics import --project hanset
 python3 autobot.py ops measure --project hanset --post-id <post_id>
 ```
 
-48h/7d 공개 지표 수집은 기존 metrics 수집 경로를 그대로 사용합니다. ops measure가 이를 대체하거나 외부 페이지를 요청하지 않습니다. `queue verify`로 공개 URL을 확인하고 해당 기간 지표 검사가 완료되어야 진단 대상입니다. measure는 로컬 rounds 로그·metrics import·기존 진단을 재사용하고 5분류 및 `판정 보류`를 유지한 문구 초안만 생성합니다. 실제 수치/분모의 숫자와 다음 단일 변경도 코드로 검사합니다.
+`--check-kind` 없는 기존 measure는 로컬 진단 경로를 유지합니다. Batch 6의 `--check-kind 48h|7d`는 아래의 수동 입력/선택적 X 공개 수집 경로를 사용합니다. `queue verify`로 공개 URL을 확인하고 해당 기간 지표 검사가 완료되어야 진단 대상입니다. measure는 로컬 rounds 로그·metrics import·기존 진단을 재사용하고 5분류 및 `판정 보류`를 유지한 문구 초안만 생성합니다. 실제 수치/분모의 숫자와 다음 단일 변경도 코드로 검사합니다.
 
 오프라인 mock fixture는 명령별 응답 객체를 담습니다. 예: `{"plan":{"plan":"오늘의 계획"},"compliance":{"verdict":"PASS","reasons":[],"checks":{"C1":{"pass":true,"note":"..."}}}}`. 실제 PASS fixture에는 C1–C15 전체가 필요합니다. mock PASS도 기존 사람 승인과 계정 확인을 대신하지 않습니다. 비즈니스 행 검증에는 mock을 쓰고, dry-run은 감사 행·로그·계획 보고서 외에는 쓰지 않습니다.
 
@@ -289,3 +289,78 @@ python3 autobot.py ops measure --project hanset --post-id <post_id>
 PR 제목: `feat(ops): DeepSeek-brain viral ops bot (plan/draft/compliance/schedule/measure)`
 
 기존 오프라인 테스트와 현재 daemon 단계 설정의 불일치도 수정했습니다. 기본 단계 순서는 SPEC.md의 7단계 표와 맞추었고 DeepSeek 레인과 사용자 지정 단계 설정 지원은 유지합니다.
+
+## Batch 6: 일일 패키지·공개 지표·다음 주 전략
+
+`ops package`는 사실확인 패킷의 게시일·확인일·허용 사실·출처·금지 조건을 읽어 렌더 호환 패키지를 만듭니다. 게시·로그인·DM·카드 렌더는 수행하지 않습니다. Python 3 표준 라이브러리만 사용합니다.
+
+```sh
+python3 autobot.py ops package --packet /workspace/viral/w1/hanset-factcheck-1108.md --date 1108 --dry-run
+python3 autobot.py ops package --packet /workspace/viral/w1/hanset-factcheck-1108.md --date 1108 --out-dir out/example-1108 --mock-file fixtures.json
+python3 autobot.py ops package --packet /workspace/viral/w1/hanset-factcheck-1108.md --date 1108
+```
+
+PASS 산출물은 `post.json`, `x.txt`, `threads.txt`, `ig_caption.txt`, `reddit.md`, 빈 `cards/`입니다. 기본 위치는 `/workspace/viral/w1/daily/MMDD`이며 `ops.paths.daily_packages` 또는 `--out-dir`(최종 디렉터리)로 변경합니다. 확인일은 패킷의 `checked Nov N`에서 가져오며 게시일과 별도로 보존합니다. 패킷에는 명시 연도, 확인일, UTM content, 공식 출처(사실 섹션의 `출처:` 또는 헤더의 `확인:` 줄)와 HANSET 링크(`## 랜딩` 섹션 또는 본문 어디든)가 필요합니다. campaign만 생략하면 `hanset_daily_w2`를 사용합니다. `## 빼야 할 것`/`금지` 섹션과 `Do not mention X`·`X 언급 금지` 같은 지시문에서 금지 어휘를 추출하며, 환불은 브랜드 토큰이 아니라 `refund`/`환불` 클래스로 차단합니다. 허용 사실에 포함된 URL은 그 사실을 인용한 경우에만 통과합니다.
+
+생성 문구는 원문 사실 조각을 선택·배치하는 방식입니다. `claim_refs`가 게시 JSON 경로와 fact ID를 연결하며, 숫자가 같아도 주차비를 참가비로 바꾸는 재서술은 차단합니다. 임의 문구나 새 숫자는 허용하지 않습니다. X는 최종 URL·footer 포함 가중 280, Threads는 URL 포함 500자 제한입니다. IG에는 프로필 링크 안내만 넣습니다. Reddit 파일의 게시에는 사람이 커뮤니티 규칙·승인을 확인해야 합니다.
+
+cover는 렌더러에서 복사한 motif/palette 목록을 사용하며, `ops.paths.history_json`에서 같은 ID를 제외한 마지막 6개의 motif 또는 배경색이 겹치면 재시도합니다. history가 없거나 손상되면 차단합니다. history는 수정하지 않습니다. 길이·cover 실패만 최초 생성 이후 최대 `ops.package.max_retries`회(기본 3회) 재시도합니다. forbidden·근거·UTM·스키마 실패는 즉시 차단합니다. 모든 package와 기존 draft는 C1–C15 compliance PASS가 필요하며 `block_on_fail=false`로 우회할 수 없습니다. 자동 PASS는 사람 승인을 대신하지 않습니다.
+
+PASS 파일은 같은 파일시스템의 고유 `.partial` 디렉터리에 작성한 후 rename합니다. 기존 최종 디렉터리가 있으면 `output_exists`로 중단하므로 별도 `--out-dir` 또는 dry-run을 사용하세요. 차단 시 최종 경로 대신 `<target>.<run_id>.<unique>.blocked/COMPLIANCE_FAIL.json`에 사유 코드·검사 결과·패킷 hash만 남깁니다. 패킷을 수정한 뒤 같은 명령을 다시 실행할 수 있습니다. 강제 종료로 남은 `.partial`은 공개 패키지가 아닙니다. 실행 중인 작업이 없는지 확인한 후 해당 잔존 디렉터리만 수동 삭제하세요.
+
+실측은 `queue verify`된 공개 게시 기록 또는 게시 완료·공개 URL·시각이 명확한 rounds 기록을 대상으로 합니다.
+
+```sh
+python3 autobot.py ops measure --post-id p_example --check-kind 48h --dry-run
+python3 autobot.py ops measure --post-id p_example --check-kind 7d
+python3 autobot.py ops measure --check-kind 48h
+```
+
+`--post-id`를 생략하면 프로젝트의 기한 도래 게시물만 처리합니다. `--check-kind`를 생략하면 기존 로컬 진단 경로를 유지합니다. 수동 파일은 `ops.paths.manual_metrics`(기본 `data/metrics/manual`)의 `<post_id>_<48h|7d>.json`입니다. IG와 Threads는 이 파일만 읽으며, 파일이 없으면 모든 값이 `unverified`입니다.
+
+```json
+{
+  "post_id": "p_example",
+  "check_kind": "48h",
+  "channel": "instagram",
+  "public_url": "https://www.instagram.com/p/example/",
+  "observed_at": "2026-11-10T19:10:00+09:00",
+  "metrics": {
+    "likes": 3,
+    "replies": 0,
+    "reposts": "unverified",
+    "views": "unverified"
+  }
+}
+```
+
+키는 `likes`, `reposts`, `replies`, `views`만 허용합니다. IG 댓글도 `replies`로 입력하며 `comments` 별칭은 받지 않습니다. 값은 비음수 정수 또는 `unverified`; 실제 0은 관측으로 저장하고 미확인은 수치 관측 행을 만들지 않습니다. 게시물·프로젝트·채널·URL·window가 일치해야 하며, `observed_at`은 timezone을 포함하고 게시 및 측정 기한 이후, 현재 이하여야 합니다. 늦은 수집은 실제 시각을 보존합니다. 파일이 있지만 잘못되었으면 차단합니다.
+
+X는 live 모드에서 `ops.measure.x_public=true`이고 기존 `X_BEARER_TOKEN`(변수명은 `x_bearer_env`로 변경 가능)이 있을 때만 고정 HTTPS API에 공개 metrics GET을 보냅니다. 기본값은 false입니다. 새 유료 서비스 가입·결제는 없습니다. API 오류·인증 실패·redirect·ID 불일치는 전체 미확인으로 기록합니다. private/organic/promoted insights는 사용하지 않습니다. dry-run/mock은 X 요청을 보내지 않습니다.
+
+원본 snapshot은 `ops_metric_snapshots`에 먼저 저장하고 기존 `metric_observations`와 `ops_measure_notes.snapshot_id`로 연결합니다. 동일 수동 파일을 재수입해도 중복 snapshot을 만들지 않습니다. DeepSeek는 코드가 만든 raw metrics·분모 블록을 그대로 사용해야 하며, 어느 필드에서든 숫자를 만들거나 metric을 바꾸면 `measure_fabricated_number`로 차단합니다. 진단이 차단되어도 원본 snapshot은 보존합니다.
+
+```sh
+python3 autobot.py ops plan --mode next-week --dry-run
+python3 autobot.py ops plan --mode next-week --mock-file fixtures.json
+```
+
+next-week는 strategies·rounds·status·날짜로 선택한 주간플랜·최근 snapshot·진단을 읽어 `ops.paths.strategy_next`(기본 `/workspace/viral/w1/strategy-next.md`)에 순위와 keep/kill/iterate를 씁니다. 미확인 또는 표본 부족은 `판정 보류`로 강제하며 KG hold 후보는 제외합니다. 성과 숫자는 참조 snapshot에서 코드가 출력합니다. 전략 원문과 게시 큐는 변경하지 않습니다. 기본 `ops plan`은 기존 일일 계획입니다.
+
+`--dry-run`은 LLM·X 네트워크와 업무 테이블 변경 없이 `out/ops/previews/<run_id>/`에 새 package/plan 미리보기를 만듭니다. `ops_runs`·감사 로그는 기록합니다. `--mock-file`은 LLM만 대체하고 로컬 저장 흐름을 수행하므로 테스트 DB·입출력 경로를 별도로 설정하세요. 명령별 응답 배열은 재시도 순서로 소비되며 소진하면 차단합니다.
+
+```json
+{
+  "package": [{"post": "replace with full package response"}, {"post": "replace with full retry response"}],
+  "compliance": {"verdict": "PASS", "reasons": [], "checks": "replace with all C1–C15 boolean checks"},
+  "plan_next": {"recommendations": []}
+}
+```
+
+위 예시의 placeholder는 실제 스키마 객체로 교체해야 합니다. 단일 명령 객체도 기존 방식대로 사용할 수 있습니다. `ops/prompts/package.md`와 `plan_next.md`에 응답 계약이 있습니다. 설정에는 `ops.paths.{daily_packages,history_json,strategies,weekly_plan_glob,strategy_next,manual_metrics,cost_log}`, `ops.package.{max_retries,cover_lookback,default_campaign,max_context_chars}`, `ops.measure.{x_public,x_bearer_env}`, `ops.strategy.lookback_days`가 추가되었습니다. cover lookback은 6으로 고정합니다.
+
+실제 DeepSeek 프로세스 호출 시도마다 `logs/ops_cost.jsonl`(경로 설정 가능)에 model·입출력 추정 token·latency·command만 한 줄 기록합니다. timeout·잘못된 응답도 기록하고 dry-run/mock은 비용 로그를 만들지 않습니다. API 키·프롬프트·응답 전문은 비용 로그에 넣지 않습니다.
+
+검증: `python3 -m py_compile autobot.py daemon.py tests/test_offline.py` 및 `python3 -I tests/test_offline.py`.
+
+PR 제목: `feat(ops): DeepSeek live package/measure/strategy upgrade`
